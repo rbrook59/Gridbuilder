@@ -23,21 +23,25 @@ function buildGrid() {
   const gridSeated = 2;
   const gridHost = 3;
   //
-  var i = 0;
-  var j = 0;
-  var gRow = 0; // guest row in arrGuest
-  var gCount = 0; // guest count in a house
-  var seatedCount = 0; // number of seats taken in a house
-  var countGuests = 0;
+  let countGuests = 0;
   //
   /** Load ranges from sheet */
   //
-  var spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-  var gridSheet = spreadSheet.getSheetByName('GridBuilder');
+  const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
+  const gridSheet = spreadSheet.getSheetByName('GridBuilder');
   //
   /** retrieve the range of control values that are used by the program  */
   //
-  var arrControl = spreadSheet.getRange('controlVariables').getValues().slice();
+  const arrControl = spreadSheet.getRange('controlVariables').getValues().slice();
+
+  // Validate control variables
+  if (!arrControl || arrControl.length < 9) {
+    throw new Error('Control variables range is missing or incomplete');
+  }
+  if (!arrControl[2] || isNaN(new Date(arrControl[2]).getTime())) {
+    throw new Error('Invalid dinner date in control variables');
+  }
+
   const ctrlTimeLapse = Number(arrControl[1]);
   const ctrlNextDinnerDate = Date(arrControl[2]);
   const ctrlThrottleSingles = Number(arrControl[3]);
@@ -49,24 +53,24 @@ function buildGrid() {
   //
   // retrieve ranges from sheet
   //
-  var arrHosts = gridSheet.getRange('rangeHosts').getValues().slice();
-  var headerHosts = arrHosts[0]; // save the header row to add back later
+  const arrHosts = gridSheet.getRange('rangeHosts').getValues().slice();
+  const headerHosts = arrHosts[0]; // save the header row to add back later
   arrHosts.splice(0, 1); //remove the header row for easier sorting
   //
-  var arrGuests = gridSheet.getRange('rangeGuests').getValues().slice();
-  var headerGuests = arrGuests[0]; // save the header row to add back later
+  const arrGuests = gridSheet.getRange('rangeGuests').getValues().slice();
+  const headerGuests = arrGuests[0]; // save the header row to add back later
   arrGuests.splice(0, 1); //remove the header row for easier sorting
-  //  
-  var arrGrid = gridSheet.getRange('rangeGrid').getValues().slice();
-  var headerGrid = arrGrid[0]; // save the header row to add back later
+  //
+  const arrGrid = gridSheet.getRange('rangeGrid').getValues().slice();
+  const headerGrid = arrGrid[0]; // save the header row to add back later
   arrGrid.splice(0, 1); //remove the header row for easier sorting
   //
-  var arrNeverMatch = gridSheet.getRange('rangeNeverMatch').getValues().slice();
+  const arrNeverMatch = gridSheet.getRange('rangeNeverMatch').getValues().slice();
   arrNeverMatch.splice(0, 1); //remove the header row for easier processing
   //
-  var dbSheet = spreadSheet.getSheetByName('connectionsDB');
-  var arrDB = dbSheet.getDataRange().getValues().slice();
-  var headerConnections = arrDB[0]; // save the header row to add back later
+  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+  const arrDB = dbSheet.getDataRange().getValues().slice();
+  const headerConnections = arrDB[0]; // save the header row to add back later
   arrDB.splice(0, 1); //remove the header row
 
   //
@@ -76,21 +80,21 @@ function buildGrid() {
   //
   // Hosts Count of Previous Connections
   if (ctrlSortHosts === 1) {
-    for (i = 0; i < arrHosts.length; i++) {
+    for (let i = 0; i < arrHosts.length; i++) {
       if (arrHosts[i][hostCode].length > 0) {
-        var count = arrDB.filter(x => {
+        const count = arrDB.filter(x => {
           return x[1].toString() === arrHosts[i][hostCode].toString();
         }).length
         arrHosts[i].push(count);
       }
     }
-    // Sort the array of Hosts  
+    // Sort the array of Hosts
     arrHosts.sort(function (a, b) {
       return b[3] - a[3]
     }); //sort list of Hosts from most connections to least connections
   }
   // Compress the host array to remove blank rows
-  for (i = arrHosts.length - 1; i >= 0; i--) {
+  for (let i = arrHosts.length - 1; i >= 0; i--) {
     if (arrHosts[i][hostCode] < 1) {
       arrHosts.splice(i, 1);
     }
@@ -98,51 +102,50 @@ function buildGrid() {
   //
   //Guest Count of Previous Connections
   if (ctrlSortGuests === 1) {
-    for (i = 0; i < arrGuests.length; i++) {
+    for (let i = 0; i < arrGuests.length; i++) {
       if (arrGuests[i][guestCode].length > 0) {
-        var count = arrDB.filter(x => {
+        const count = arrDB.filter(x => {
           return x[1].toString() === arrGuests[i][guestCode].toString();
         }).length
         arrGuests[i].push(count);
       }
-      // Sort the array of Guests    
+      // Sort the array of Guests
       arrGuests.sort(function (a, b) {
         return b[3] - a[3]
-      }); //sort list of Guests in descending order 
+      }); //sort list of Guests in descending order
     }
   }
   // Count how many guests to process to ignore blank rows
-  for (i = 0; i < arrGuests.length; i++) {
+  for (let i = 0; i < arrGuests.length; i++) {
     if (arrGuests[i][guestCode].length > 0) {
       countGuests++
     }
   }
   //
-  // Compress the arrNeverMatch to remove blank rows
-  for (i = arrNeverMatch.length - 1; i >= 0; i--) {
-    if (arrNeverMatch[i] < 1) {
-      arrNeverMatch.splice(i, 1);
+  // Filter and create bidirectional Set for never-match pairs
+  const setNeverMatch = new Set();
+  for (let i = 0; i < arrNeverMatch.length; i++) {
+    if (arrNeverMatch[i][0] && arrNeverMatch[i][0].toString().length > 0) {
+      const pair = arrNeverMatch[i][0].toString();
+      setNeverMatch.add(pair);
+      // Add reverse pair
+      const parts = pair.split('-');
+      if (parts.length === 2) {
+        setNeverMatch.add([parts[1], parts[0]].join('-'));
+      }
     }
-  }
-  // Duplicate each entry in the arrNeverMatch in the reverse order
-  // Use existing member1-member2 entry and create additional element of member2-member1
-  //
-  for (i = arrNeverMatch.length - 1; i >= 0; i--) {
-    let arrTemp = [];
-    arrTemp = arrNeverMatch[i].toString().split(/-/);
-    arrNeverMatch.push([arrTemp[1], arrTemp[0]].join('-'));
   }
   /** check control flags, clear the seated flag and the Grid  */
   //
   if (ctrlClearSeated === 1) {
-    for (i = 0; i < countGuests; i++) {
+    for (let i = 0; i < countGuests; i++) {
       arrGuests[i][guestSeated] = "No"
     }
   }
   // Clear the Grid
   if (ctrlClearGrid === 1) {
-    for (i = 0; i < arrGrid.length; i++) {
-      for (j = 0; j < 9; j++) {
+    for (let i = 0; i < arrGrid.length; i++) {
+      for (let j = 0; j < 9; j++) {
         arrGrid[i][j] = null;
       }
     }
@@ -150,21 +153,24 @@ function buildGrid() {
   //
   /**  CREATE THE GRID */
   //
-  for (i = 0; i < arrHosts.length; i++) { // This many houses to process
+  for (let i = 0; i < arrHosts.length; i++) { // This many houses to process
     //
+    let seatedCount;
+    let arrHouse;
+
     if (arrGrid[i][gridHouse] === null) { // initialize the House on first loop
       arrGrid[i][gridHouse] = i + 1; // array starts at 0, so add 1
       arrGrid[i][gridSeats] = arrHosts[i][hostSeats]; // How many can be seated at this house
       arrGrid[i][gridHost] = arrHosts[i][hostCode]; // Host name code
       seatedCount = Number(arrHosts[i][hostCount]); // this many seats for the host (will be 1 or 2)
       //
-      var arrHouse = []; // 1D empty array to track guests assigned
+      arrHouse = []; // 1D empty array to track guests assigned
       arrHouse.push(arrGrid[i][gridHost]); // add the host code to the House array
       //
     } else { // the Grid already has data stored.  Load that data into the variables used for processing
-      var arrHouse = []; // 1D empty array to track guests assigned
+      arrHouse = []; // 1D empty array to track guests assigned
       for (let n = 3; n < arrGrid[i].length; n++) {
-        if (arrGrid[i][n] != null) {
+        if (arrGrid[i][n] !== null) {
           arrHouse.push(arrGrid[i][n]);
         }
       }
@@ -173,49 +179,32 @@ function buildGrid() {
     //
     // Fill the house - with up to 5 guests or until seats are full
     //
-    for (gCount = arrHouse.length; gCount < 5; gCount++) {
+    for (let gCount = arrHouse.length; gCount < 5; gCount++) {
       if (seatedCount >= arrHosts[i][hostSeats]) { // House is full, go to the next house
         break;
       }
-      //      
+      //
       //  The array "doesItWork" tests each potential member in the house.  Any "false" values and the guest is rejected.
       //
       //
-      for (gRow = 0; gRow < countGuests; gRow++) { // cycle through each member
-        if (ctrlThrottleSingles === 1 && gCount < 2 && arrGuests[gRow][guestCount] < 2) { // wait to seat singles
+      for (let gRow = 0; gRow < countGuests; gRow++) { // cycle through each member
+        if (ctrlThrottleSingles === 1 && arrGuests[gRow][guestCount] === 1 && gCount < 2) { // wait to seat singles
           continue;
         }
         if (arrGuests[gRow][guestSeated] === "No" && seatedCount + arrGuests[gRow][guestCount] <= arrHosts[i][hostSeats]) {  // Does this guest need a seat and can they fit in this house
           //
-          var doesItWork = []; // array that gets loaded with True or False values.   Any False value and the guest is rejected
+          const doesItWork = []; // array that gets loaded with True or False values.   Any False value and the guest is rejected
           //
-          switch (gCount) {
-            case 1:
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[0]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              break;
-            case 2:
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[0]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[1]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              break;
-            case 3:
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[0]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[1]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[2]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              break;
-            case 4:
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[0]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[1]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[2]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[3]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              break;
-            case 5:
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[0]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[1]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[2]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[3]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              doesItWork.push(memberMatch([arrGuests[gRow][guestCode], arrHouse[4]].join('-'), ctrlTimeLapse, arrDB, arrNeverMatch));
-              break;
-          } // switch
+          // Check this guest against all current members in the house
+          for (let h = 0; h < gCount; h++) {
+            doesItWork.push(memberMatch(
+              [arrGuests[gRow][guestCode], arrHouse[h]].join('-'),
+              ctrlTimeLapse,
+              arrDB,
+              setNeverMatch
+            ));
+          }
+
           if (doesItWork.findIndex((tf) => tf === false) === -1) { // This guest works if no false values are found
             arrHouse.push(arrGuests[gRow][guestCode]);
             arrGuests[gRow][guestSeated] = null;
@@ -250,7 +239,7 @@ function buildGrid() {
   //
   // Remove the column added for sorting before writing back to the sheet
   if (ctrlSortGuests === 1) {
-    for (i = 0; i < arrGuests.length; i++) {
+    for (let i = 0; i < arrGuests.length; i++) {
       if (arrGuests[i][guestCode].length > 0) {
         arrGuests[i].pop();
       }
@@ -259,35 +248,31 @@ function buildGrid() {
   // write the arrGuests back to the sheet
   arrGuests.splice(0, 0, headerGuests);
   gridSheet.getRange('rangeGuests').setValues(arrGuests);
+
+  // Report unseated members
+  reportUnseatedMembers(arrGuests, guestCode, guestSeated);
 }
-function memberMatch(strToCheck, timeLapse, arrToScan, arrNever) {
-  canMatch = true;
-  //
-  // scan the connections list for a match and check the timeLapse
-  //
-  for (x = 0; x < arrToScan.length; x++) {
-    if (strToCheck == arrToScan[x][0] && timeLapse > arrToScan[x][6]) {
-      canMatch = false
-      break;
+function memberMatch(strToCheck, timeLapse, arrToScan, setNeverMatch) {
+  // Check never-match list (O(1) instead of O(n))
+  if (setNeverMatch.has(strToCheck)) {
+    return false;
+  }
+
+  // Check time-based constraints
+  for (let x = 0; x < arrToScan.length; x++) {
+    if (strToCheck === arrToScan[x][0] && timeLapse > arrToScan[x][6]) {
+      return false;
     }
   }
-  //
-  // Scan the exceptions list for a match.
-  //
-  for (x = 0; x < arrNever.length; x++) {
-    if (strToCheck == arrNever[x]) {
-      canMatch = false;
-      break
-    }
-  }
-  return canMatch;
+
+  return true;
 }
 function prepConnections() {
   //
   // recalculates the number of months between members meeting and returns the sorted array to the calling function
   //
   let result = SpreadsheetApp.getUi().alert("Run this once before building the Grid.Check that the dinner date is correct on the spreadsheet.  Click OK to run this script, Cancel to stop", SpreadsheetApp.getUi().ButtonSet.OK_CANCEL);
-  if (result != SpreadsheetApp.getUi().Button.OK) {
+  if (result !== SpreadsheetApp.getUi().Button.OK) {
     return;
   }
   /** connectionDB Sheet layout
@@ -315,7 +300,7 @@ function prepConnections() {
   //
   // update the connections database with the length of time, in months, since the members last met.
   //
-  for (i = 0; i < arrDB.length; i++) {
+  for (let i = 0; i < arrDB.length; i++) {
     let lastDate = new Date(arrDB[i][4]);
     arrDB[i][6] = ctrlNextDinnerDate.getMonth() - lastDate.getMonth() +
       (12 * (ctrlNextDinnerDate.getFullYear() - lastDate.getFullYear()));  // write the number of months to the array[6]
@@ -341,7 +326,7 @@ function updateConnections() {
   // members that sat together at a dinner.  This updates the history of the members that have been together.
   //
   let result = SpreadsheetApp.getUi().alert("Run this after the dinner date.  Update the Grid with any last minute changes and check that the dinner date is correct on the spreadsheet.  Click OK to run this script, Cancel to stop", SpreadsheetApp.getUi().ButtonSet.OK_CANCEL);
-  if (result != SpreadsheetApp.getUi().Button.OK) {
+  if (result !== SpreadsheetApp.getUi().Button.OK) {
     return;
   }
   /** connectionDB Sheet layout
@@ -369,14 +354,14 @@ function updateConnections() {
   //
   let spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
   let dbSheet = spreadSheet.getSheetByName('connectionsDB');
-  var arrDB = dbSheet.getDataRange().getValues().slice();
+  const arrDB = dbSheet.getDataRange().getValues().slice();
   let headerRow = arrDB[0]; // save the header row to add back later
   arrDB.splice(0, 1); //remove the header row
   //
   // Get the Grid from the worksheet
   //
-  var gridSheet = spreadSheet.getSheetByName('GridBuilder');
-  var arrGrid = gridSheet.getRange('rangeGrid').getValues().slice();
+  const gridSheet = spreadSheet.getSheetByName('GridBuilder');
+  const arrGrid = gridSheet.getRange('rangeGrid').getValues().slice();
   let headerGrid = arrGrid[0]; // save the header row to add back later
   arrGrid.splice(0, 1); //remove the header row for easier sorting
   //
@@ -387,54 +372,32 @@ function updateConnections() {
   //
   // count the number of houses to process
   //
-  for (i = arrGrid.length - 1; i >= 0; i--) {
+  for (let i = arrGrid.length - 1; i >= 0; i--) {
     if (arrGrid[i][3] < 1) { // blank host code in Grid.  Remove the row.
       arrGrid.splice(i, 1);
     }
   }
-  var houseCount = arrGrid.length;
+  const houseCount = arrGrid.length;
   //
-  for (i = 0; i < houseCount; i++) {
+  for (let i = 0; i < houseCount; i++) {
     //
     // count the number of members to process in the house
     //
-    var guestCount = 0;
-    for (j = 3; j < arrGrid[i].length; j++) {  // 3 is the array position for the host
+    let guestCount = 0;
+    for (let j = 3; j < arrGrid[i].length; j++) {  // 3 is the array position for the host
       if (arrGrid[i][j].length > 0) {
         guestCount++;
       }
     }
-    for (j = 1; j < guestCount; j++) {
-      switch (j) {
-        case 1:
-          for (k = 1; k < guestCount; k++) {
-            writeConnection(arrGrid[i][3], arrGrid[i][k + 3], ctrlNextDinnerDate, "Host", arrDB);
-          }
-          break;
-        case 2:
-          for (k = 2; k < guestCount; k++) {
-            writeConnection(arrGrid[i][4], arrGrid[i][k + 3], ctrlNextDinnerDate, "", arrDB);
-          }
-          break;
-        case 3:
-          for (k = 3; k < guestCount; k++) {
-            writeConnection(arrGrid[i][5], arrGrid[i][k + 3], ctrlNextDinnerDate, "", arrDB);
-          }
-          break;
-        case 4:
-          for (k = 4; k < guestCount; k++) {
-            writeConnection(arrGrid[i][6], arrGrid[i][k + 3], ctrlNextDinnerDate, "", arrDB);
-          }
-          break;
-        case 5:
-          for (k = 5; k < guestCount; k++) {
-            writeConnection(arrGrid[i][7], arrGrid[i][k + 3], ctrlNextDinnerDate, "", arrDB);
-          }
-          break;
+    // Create connections for all pairs of members in the house
+    for (let j = 1; j < guestCount; j++) {
+      const isHost = (j === 1) ? "Host" : "";
+      for (let k = j; k < guestCount; k++) {
+        writeConnection(arrGrid[i][j + 3], arrGrid[i][k + 3], ctrlNextDinnerDate, isHost, arrDB);
       }
     }
   }
-  for (i = 0; i < arrDB.length; i++) {
+  for (let i = 0; i < arrDB.length; i++) {
     let lastDate = new Date(arrDB[i][4]);
     arrDB[i][6] = ctrlNextDinnerDate.getMonth() - lastDate.getMonth() +
       (12 * (ctrlNextDinnerDate.getFullYear() - lastDate.getFullYear()));  // write the number of months to the array[6]
@@ -462,7 +425,7 @@ function updateConnections() {
 // subroutine to write new connections to connectionsDB
 //
 function writeConnection(memberOne, memberTwo, dinnerDate, memberRole, arrTmp) {
-  let tmpYear = dinnerDate.getFullYear()
+  const tmpYear = dinnerDate.getFullYear()
   arrTmp.push([[memberOne, memberTwo].join('-'), memberOne, memberTwo, tmpYear, dinnerDate, memberRole, 0]);
   //
   // create a duplicate entry with the key flipped. member1-member2 and member2-member1
@@ -470,10 +433,103 @@ function writeConnection(memberOne, memberTwo, dinnerDate, memberRole, arrTmp) {
   arrTmp.push([[memberTwo, memberOne].join('-'), memberOne, memberTwo, tmpYear, dinnerDate, memberRole, 0]);
   return;
 }
+
+function reportUnseatedMembers(arrGuests, guestCodeIdx, guestSeatedIdx) {
+  const unseated = [];
+
+  // Skip header row (index 0)
+  for (let i = 1; i < arrGuests.length; i++) {
+    if (arrGuests[i][guestCodeIdx] &&
+        arrGuests[i][guestCodeIdx].toString().length > 0 &&
+        arrGuests[i][guestSeatedIdx] === "No") {
+      unseated.push({
+        code: arrGuests[i][guestCodeIdx],
+        count: arrGuests[i][1] || 1
+      });
+    }
+  }
+
+  if (unseated.length > 0) {
+    const msg = `Unseated members (${unseated.length}):\n` +
+                unseated.map(m => `  ${m.code} (party of ${m.count})`).join('\n');
+    SpreadsheetApp.getUi().alert('Seating Incomplete', msg, SpreadsheetApp.getUi().ButtonSet.OK);
+  } else {
+    SpreadsheetApp.getUi().alert('Success', 'All members seated successfully!', SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+function auditGrid() {
+  const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
+  const gridSheet = spreadSheet.getSheetByName('GridBuilder');
+  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+
+  const arrGrid = gridSheet.getRange('rangeGrid').getValues().slice();
+  arrGrid.splice(0, 1); // Remove header
+
+  const arrDB = dbSheet.getDataRange().getValues().slice();
+  arrDB.splice(0, 1); // Remove header
+
+  const report = [];
+  let minMonths = Infinity;
+  let maxMonths = -Infinity;
+  let totalConnections = 0;
+
+  for (let i = 0; i < arrGrid.length; i++) {
+    if (!arrGrid[i][3]) continue; // Skip empty houses
+
+    const members = [];
+    for (let j = 3; j < arrGrid[i].length; j++) {
+      if (arrGrid[i][j]) members.push(arrGrid[i][j]);
+    }
+
+    report.push(`\nHouse ${i + 1}: ${members.join(', ')}`);
+
+    // Check all pairs
+    for (let m = 0; m < members.length; m++) {
+      for (let n = m + 1; n < members.length; n++) {
+        const pair = `${members[m]}-${members[n]}`;
+        const connection = arrDB.find(row => row[0] === pair);
+        const monthsApart = connection ? connection[6] : 'Never met';
+
+        if (typeof monthsApart === 'number') {
+          minMonths = Math.min(minMonths, monthsApart);
+          maxMonths = Math.max(maxMonths, monthsApart);
+          totalConnections++;
+        }
+
+        report.push(`  ${pair}: ${monthsApart} months`);
+      }
+    }
+  }
+
+  // Add summary
+  report.unshift('=== GRID AUDIT REPORT ===');
+  if (totalConnections > 0) {
+    report.push(`\n=== SUMMARY ===`);
+    report.push(`Total connections analyzed: ${totalConnections}`);
+    report.push(`Minimum separation: ${minMonths} months`);
+    report.push(`Maximum separation: ${maxMonths} months`);
+  }
+
+  const reportText = report.join('\n');
+  Logger.log(reportText);
+
+  // Show in alert (truncate if too long)
+  const maxAlertLength = 1000;
+  if (reportText.length > maxAlertLength) {
+    SpreadsheetApp.getUi().alert('Audit Report',
+      reportText.substring(0, maxAlertLength) + '\n\n... (truncated, see logs for full report)',
+      SpreadsheetApp.getUi().ButtonSet.OK);
+  } else {
+    SpreadsheetApp.getUi().alert('Audit Report', reportText, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('Grid Builder')
     .addItem('Build Grid', 'buildGrid')
+    .addSeparator()
+    .addItem('Audit Current Grid', 'auditGrid')
     .addSeparator()
     .addItem('Prepare Connections Data', 'prepConnections')
     .addSeparator()
