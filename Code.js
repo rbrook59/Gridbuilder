@@ -3,13 +3,85 @@
 // 2. create an orphans list to give options of where unseated members can sit.
 // 3.
 //
+/** CACHE HELPER FUNCTIONS */
+function buildConnectionsCache() {
+  const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+  const arrDB = dbSheet.getDataRange().getValues().slice();
+  arrDB.splice(0, 1); // Remove header
+
+  // Build Map: key = "member1-member2", value = months apart
+  const connectionsMap = {};
+  for (let i = 0; i < arrDB.length; i++) {
+    const key = arrDB[i][0]; // member1-member2 pair
+    const months = arrDB[i][6]; // months apart
+
+    // Store only the minimum months for each pair (since array is sorted)
+    if (!connectionsMap[key]) {
+      connectionsMap[key] = months;
+    }
+  }
+
+  // Store in cache using chunks (CacheService has 100KB limit per entry)
+  const cache = CacheService.getScriptCache();
+  const jsonString = JSON.stringify(connectionsMap);
+  const chunkSize = 90000; // 90KB chunks to stay under 100KB limit
+  const chunks = [];
+
+  for (let i = 0; i < jsonString.length; i += chunkSize) {
+    chunks.push(jsonString.substring(i, i + chunkSize));
+  }
+
+  // Store chunk count and each chunk
+  cache.put('connectionsMap_count', chunks.length.toString(), 21600);
+  for (let i = 0; i < chunks.length; i++) {
+    cache.put('connectionsMap_' + i, chunks[i], 21600);
+  }
+
+  return connectionsMap;
+}
+
+function getConnectionsMap() {
+  const cache = CacheService.getScriptCache();
+  const chunkCount = cache.get('connectionsMap_count');
+
+  if (chunkCount) {
+    // Reconstruct from chunks
+    let jsonString = '';
+    for (let i = 0; i < parseInt(chunkCount); i++) {
+      const chunk = cache.get('connectionsMap_' + i);
+      if (!chunk) {
+        // Cache incomplete - rebuild
+        return buildConnectionsCache();
+      }
+      jsonString += chunk;
+    }
+    return JSON.parse(jsonString);
+  }
+
+  // Cache miss - rebuild
+  return buildConnectionsCache();
+}
+
+function clearConnectionsCache() {
+  const cache = CacheService.getScriptCache();
+  const chunkCount = cache.get('connectionsMap_count');
+
+  if (chunkCount) {
+    for (let i = 0; i < parseInt(chunkCount); i++) {
+      cache.remove('connectionsMap_' + i);
+    }
+    cache.remove('connectionsMap_count');
+  }
+}
+
 function buildGrid() {
   //
   // creates a draft Grid for the upcoming dinner using a list of Hosts and Guests.
   //
   /** Set up variables aligned with table columns from spreadsheet
    *  change these if the range format or column order is changed on the sheet */
-  // 
+  //
   const hostCode = 0;
   const hostCount = 1;
   const hostSeats = 2;
@@ -68,10 +140,8 @@ function buildGrid() {
   const arrNeverMatch = gridSheet.getRange('rangeNeverMatch').getValues().slice();
   arrNeverMatch.splice(0, 1); //remove the header row for easier processing
   //
-  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
-  const arrDB = dbSheet.getDataRange().getValues().slice();
-  const headerConnections = arrDB[0]; // save the header row to add back later
-  arrDB.splice(0, 1); //remove the header row
+  // Load connections from cache instead of sheet
+  const connectionsMap = getConnectionsMap();
 
   //
   /**Count the number of connections for each Host and for each Guest and sort the list, descending order.
@@ -82,9 +152,14 @@ function buildGrid() {
   if (ctrlSortHosts === 1) {
     for (let i = 0; i < arrHosts.length; i++) {
       if (arrHosts[i][hostCode].length > 0) {
-        const count = arrDB.filter(x => {
-          return x[1].toString() === arrHosts[i][hostCode].toString();
-        }).length
+        // Count connections using Map keys
+        let count = 0;
+        for (let key in connectionsMap) {
+          const parts = key.split('-');
+          if (parts[0] === arrHosts[i][hostCode].toString()) {
+            count++;
+          }
+        }
         arrHosts[i].push(count);
       }
     }
@@ -104,9 +179,14 @@ function buildGrid() {
   if (ctrlSortGuests === 1) {
     for (let i = 0; i < arrGuests.length; i++) {
       if (arrGuests[i][guestCode].length > 0) {
-        const count = arrDB.filter(x => {
-          return x[1].toString() === arrGuests[i][guestCode].toString();
-        }).length
+        // Count connections using Map keys
+        let count = 0;
+        for (let key in connectionsMap) {
+          const parts = key.split('-');
+          if (parts[0] === arrGuests[i][guestCode].toString()) {
+            count++;
+          }
+        }
         arrGuests[i].push(count);
       }
       // Sort the array of Guests
@@ -200,7 +280,7 @@ function buildGrid() {
             doesItWork.push(memberMatch(
               [arrGuests[gRow][guestCode], arrHouse[h]].join('-'),
               ctrlTimeLapse,
-              arrDB,
+              connectionsMap,
               setNeverMatch
             ));
           }
@@ -252,17 +332,16 @@ function buildGrid() {
   // Report unseated members
   reportUnseatedMembers(arrGuests, guestCode, guestSeated);
 }
-function memberMatch(strToCheck, timeLapse, arrToScan, setNeverMatch) {
-  // Check never-match list (O(1) instead of O(n))
+function memberMatch(strToCheck, timeLapse, connectionsMap, setNeverMatch) {
+  // Check never-match list (O(1) lookup)
   if (setNeverMatch.has(strToCheck)) {
     return false;
   }
 
-  // Check time-based constraints
-  for (let x = 0; x < arrToScan.length; x++) {
-    if (strToCheck === arrToScan[x][0] && timeLapse > arrToScan[x][6]) {
-      return false;
-    }
+  // Check time-based constraints using Map (O(1) lookup instead of O(n))
+  const monthsApart = connectionsMap[strToCheck];
+  if (monthsApart !== undefined && timeLapse > monthsApart) {
+    return false;
   }
 
   return true;
@@ -313,12 +392,16 @@ function prepConnections() {
   }); // sorts on first element alphabetically then ascending on # of months
   //
   // write the array back to the sheet
-  // 
+  //
   arrDB.splice(0, 0, headerRow); // add the headerRow back to the top of the array
   let rowCount = arrDB.length;
   let colCount = arrDB[0].length;
   let connectionsRange = dbSheet.getRange(1, 1, rowCount, colCount); // define where the array is to be written back to the sheet
   connectionsRange.setValues(arrDB); // write to the sheet
+
+  // Rebuild cache after updating connections
+  clearConnectionsCache();
+  buildConnectionsCache();
 }
 function updateConnections() {
   //
@@ -411,12 +494,16 @@ function updateConnections() {
   }); // sorts on first element alphabetically then ascending on # of months
   //
   // write the array back to the sheet
-  // 
+  //
   arrDB.splice(0, 0, headerRow); // add the headerRow back to the top of the array
   let rowCount = arrDB.length;
   let colCount = arrDB[0].length;
   let connectionsRange = dbSheet.getRange(1, 1, rowCount, colCount); // define where the array is to be written back to the sheet
   connectionsRange.setValues(arrDB); // write to the sheet
+
+  // Rebuild cache after updating connections
+  clearConnectionsCache();
+  buildConnectionsCache();
 }
 //
 /** SUPPORTING FUNCTIONS */
@@ -469,7 +556,7 @@ function auditGrid() {
   const arrDB = dbSheet.getDataRange().getValues().slice();
   arrDB.splice(0, 1); // Remove header
 
-  const report = [];
+  const auditData = [];
   let minMonths = Infinity;
   let maxMonths = -Infinity;
   let totalConnections = 0;
@@ -482,9 +569,9 @@ function auditGrid() {
       if (arrGrid[i][j]) members.push(arrGrid[i][j]);
     }
 
-    report.push(`\nHouse ${i + 1}: ${members.join(', ')}`);
+    const houseNumber = i + 1;
 
-    // Check all pairs
+    // Check all pairs and create structured data rows
     for (let m = 0; m < members.length; m++) {
       for (let n = m + 1; n < members.length; n++) {
         const pair = `${members[m]}-${members[n]}`;
@@ -497,32 +584,47 @@ function auditGrid() {
           totalConnections++;
         }
 
-        report.push(`  ${pair}: ${monthsApart} months`);
+        // Add row: House | Member1 | Member2 | Months Apart
+        auditData.push([houseNumber, members[m], members[n], monthsApart]);
       }
     }
   }
 
-  // Add summary
-  report.unshift('=== GRID AUDIT REPORT ===');
-  if (totalConnections > 0) {
-    report.push(`\n=== SUMMARY ===`);
-    report.push(`Total connections analyzed: ${totalConnections}`);
-    report.push(`Minimum separation: ${minMonths} months`);
-    report.push(`Maximum separation: ${maxMonths} months`);
-  }
-
-  const reportText = report.join('\n');
-  Logger.log(reportText);
-
-  // Show in alert (truncate if too long)
-  const maxAlertLength = 1000;
-  if (reportText.length > maxAlertLength) {
-    SpreadsheetApp.getUi().alert('Audit Report',
-      reportText.substring(0, maxAlertLength) + '\n\n... (truncated, see logs for full report)',
-      SpreadsheetApp.getUi().ButtonSet.OK);
+  // Get or create Grid Audit sheet
+  let auditSheet = spreadSheet.getSheetByName('Grid Audit');
+  if (!auditSheet) {
+    auditSheet = spreadSheet.insertSheet('Grid Audit');
   } else {
-    SpreadsheetApp.getUi().alert('Audit Report', reportText, SpreadsheetApp.getUi().ButtonSet.OK);
+    auditSheet.clear();
   }
+
+  // Write header row
+  const header = [['House', 'Member 1', 'Member 2', 'Months Apart']];
+  auditSheet.getRange(1, 1, 1, 4).setValues(header);
+
+  // Format header
+  auditSheet.getRange(1, 1, 1, 4).setFontWeight('bold').setBackground('#d9d9d9');
+
+  // Write audit data
+  if (auditData.length > 0) {
+    auditSheet.getRange(2, 1, auditData.length, 4).setValues(auditData);
+
+    // Auto-resize columns
+    auditSheet.autoResizeColumns(1, 4);
+
+    // Freeze header row
+    auditSheet.setFrozenRows(1);
+  }
+
+  // Create summary message
+  let summaryMsg = `Audit complete! ${totalConnections} connections analyzed.\n\n`;
+  if (totalConnections > 0) {
+    summaryMsg += `Minimum separation: ${minMonths} months\n`;
+    summaryMsg += `Maximum separation: ${maxMonths} months\n\n`;
+    summaryMsg += `Results written to "Grid Audit" sheet.`;
+  }
+
+  SpreadsheetApp.getUi().alert('Audit Complete', summaryMsg, SpreadsheetApp.getUi().ButtonSet.OK);
 }
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
