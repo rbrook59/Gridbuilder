@@ -1,6 +1,6 @@
 // FUTURE DEVELOPMENT NOTES
-// 1. create a audit of a Grid based on pairs of members and # of months apart
-// 2. create an orphans list to give options of where unseated members can sit.
+// 1. create a list of options where the unseated guests will work best.
+// 
 
 /** CONSTANTS - Array Column Indices */
 const HOST_COLUMNS = {
@@ -38,6 +38,11 @@ const CONNECTION_COLUMNS = {
   HOST_ROLE: 5,
   MONTHS_APART: 6
 };
+
+/** CONFIGURATION CONSTANTS */
+const SHUFFLE_THRESHOLD = 0.7; // Shuffle bottom 30% of arrays during random restart
+const MAX_ATTEMPTS = 20; // Increased from 10 for better solutions
+const LOOKAHEAD_CRITICAL_THRESHOLD = 2; // Look-ahead protection for guests with ≤ N compatible houses
 
 /** CACHE HELPER FUNCTIONS */
 function buildConnectionsCache() {
@@ -147,11 +152,60 @@ function clearConnectionsCache() {
   cache.remove('connectionCounts');
 }
 
-function buildGrid() {
-  // Creates a draft Grid for the upcoming dinner using a list of Hosts and Guests
-  // Uses random restart strategy to try multiple seating arrangements
+/**
+ * Builds an enhanced connections map filtered to only tonight's attendees
+ * @param {Array} guests - Array of guest rows
+ * @param {Array} hosts - Array of host rows
+ * @param {Object} connectionsMap - Original connections map from cache
+ * @param {number} timeLapse - Time constraint in months
+ * @returns {Object} Enhanced map with structure: { "CODE1-CODE2": { monthsApart: number, isConstrained: boolean } }
+ */
+function buildEnhancedConnectionsMap(guests, hosts, connectionsMap, timeLapse) {
+  const enhanced = {};
 
-  // Load ranges from sheet
+  // Collect all attendee codes
+  const allAttendees = [];
+  for (let i = 0; i < hosts.length; i++) {
+    if (hosts[i][HOST_COLUMNS.CODE]) {
+      allAttendees.push(hosts[i][HOST_COLUMNS.CODE]);
+    }
+  }
+  for (let i = 0; i < guests.length; i++) {
+    if (guests[i][GUEST_COLUMNS.CODE]) {
+      allAttendees.push(guests[i][GUEST_COLUMNS.CODE]);
+    }
+  }
+
+  // Build all pairs for tonight's attendees
+  for (let i = 0; i < allAttendees.length; i++) {
+    for (let j = i + 1; j < allAttendees.length; j++) {
+      const key = `${allAttendees[i]}-${allAttendees[j]}`;
+      const reverseKey = `${allAttendees[j]}-${allAttendees[i]}`;
+
+      // Check both directions in original map
+      const months = connectionsMap[key] || connectionsMap[reverseKey] || 999;
+
+      const pairData = {
+        monthsApart: months,
+        isConstrained: months < timeLapse
+      };
+
+      // Store both directions
+      enhanced[key] = pairData;
+      enhanced[reverseKey] = pairData;
+    }
+  }
+
+  Logger.log(`Enhanced connections map built: ${Object.keys(enhanced).length} pairs for ${allAttendees.length} attendees`);
+  return enhanced;
+}
+
+/**
+ * BuildGrid - Guest-Centric Approach
+ * Places guests in order, scoring houses based on capacity and connection quality
+ */
+function buildGrid() {
+  // SETUP PHASE
   const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
   const gridSheet = spreadSheet.getSheetByName('GridBuilder');
 
@@ -165,9 +219,6 @@ function buildGrid() {
   // Validate control variables
   if (!arrControl || arrControl.length < 9) {
     throw new Error('Control variables range is missing or incomplete');
-  }
-  if (!arrControl[2] || isNaN(new Date(arrControl[2]).getTime())) {
-    throw new Error('Invalid dinner date in control variables');
   }
 
   const ctrlTimeLapse = Number(arrControl[1]);
@@ -204,287 +255,692 @@ function buildGrid() {
   const arrNeverMatch = neverMatchRange.getValues().slice();
   arrNeverMatch.splice(0, 1);
 
-  // Load connections from cache
-  const connectionsMap = getConnectionsMap();
-  const connectionCounts = getConnectionCounts();
+  // Load connections from cache and build enhanced map for tonight's attendees
+  const originalConnectionsMap = getConnectionsMap();
+  const setNeverMatch = buildNeverMatchSet(arrNeverMatch);
 
-  // Filter and create bidirectional Set for never-match pairs
-  const setNeverMatch = new Set();
-  for (let i = 0; i < arrNeverMatch.length; i++) {
-    if (arrNeverMatch[i][0] && arrNeverMatch[i][0].toString().length > 0) {
-      const pair = arrNeverMatch[i][0].toString();
-      setNeverMatch.add(pair);
-      // Add reverse pair
-      const parts = pair.split('-');
-      if (parts.length === 2) {
-        setNeverMatch.add([parts[1], parts[0]].join('-'));
+  // Build enhanced connections map (filtered to tonight's attendees with pre-computed constraints)
+  const connectionsMap = buildEnhancedConnectionsMap(
+    arrGuestsOriginal,
+    arrHostsOriginal,
+    originalConnectionsMap,
+    ctrlTimeLapse
+  );
+
+  // GUEST-CENTRIC ALGORITHM
+  Logger.log('\n========== Starting BuildGrid (Guest-Centric) ==========');
+
+  // Create working copies
+  const finalHosts = arrHostsOriginal.map(row => [...row]);
+  let finalGuests = arrGuestsOriginal.map(row => [...row]);
+  let finalGrid = arrGridOriginal.map(row => [...row]);
+
+  // Clear seated flags if requested
+  if (ctrlClearSeated === 1) {
+    for (let i = 0; i < finalGuests.length; i++) {
+      if (finalGuests[i][GUEST_COLUMNS.CODE]) {
+        finalGuests[i][GUEST_COLUMNS.SEATED] = "No";
       }
     }
   }
 
-  // RANDOM RESTART LOOP - Try multiple times with randomized ordering
-  const maxAttempts = 10;
-  let bestGrid = null;
-  let bestGuests = null;
-  let bestUnseatedCount = Infinity;
-  let attemptNumber = 0;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    attemptNumber++;
-
-    // Create fresh copies for this attempt
-    const arrHosts = arrHostsOriginal.map(row => [...row]);
-    const arrGuests = arrGuestsOriginal.map(row => [...row]);
-    const arrGrid = arrGridOriginal.map(row => [...row]);
-    let countGuests = 0;
-
-    // Count the number of connections for each Host and for each Guest and sort the list, descending order
-    // This algorithm prioritizes seating members who have attended the most dinners
-    // since they will be the most difficult to seat with fellow members
-
-    // Hosts Count of Previous Connections
-    if (ctrlSortHosts === 1) {
-      for (let i = 0; i < arrHosts.length; i++) {
-        if (arrHosts[i][HOST_COLUMNS.CODE].length > 0) {
-          const count = connectionCounts[arrHosts[i][HOST_COLUMNS.CODE]] || 0;
-          arrHosts[i].push(count);
-        }
+  // Clear grid if requested
+  if (ctrlClearGrid === 1) {
+    for (let i = 0; i < finalGrid.length; i++) {
+      for (let j = 0; j <= GRID_COLUMNS.GUEST_5; j++) {
+        finalGrid[i][j] = null;
       }
-      arrHosts.sort((a, b) => b[HOST_COLUMNS.ORDER] - a[HOST_COLUMNS.ORDER]);
-    }
-
-    // Compress the host array to remove blank rows
-    for (let i = arrHosts.length - 1; i >= 0; i--) {
-      if (arrHosts[i][HOST_COLUMNS.CODE] < 1) {
-        arrHosts.splice(i, 1);
-      }
-    }
-
-    // Guest Count of Previous Connections
-    if (ctrlSortGuests === 1) {
-      for (let i = 0; i < arrGuests.length; i++) {
-        if (arrGuests[i][GUEST_COLUMNS.CODE].length > 0) {
-          const count = connectionCounts[arrGuests[i][GUEST_COLUMNS.CODE]] || 0;
-          arrGuests[i].push(count);
-        }
-      }
-      arrGuests.sort((a, b) => b[GUEST_COLUMNS.ORDER] - a[GUEST_COLUMNS.ORDER]);
-    }
-
-    // After attempt 1, add slight randomization to the order
-    if (attempt > 0) {
-      // Separate non-blank and blank hosts
-      const nonBlankHosts = [];
-      const blankHosts = [];
-      for (let i = 0; i < arrHosts.length; i++) {
-        if (arrHosts[i][HOST_COLUMNS.CODE] && arrHosts[i][HOST_COLUMNS.CODE].toString().length > 0) {
-          nonBlankHosts.push(arrHosts[i]);
-        } else {
-          blankHosts.push(arrHosts[i]);
-        }
-      }
-
-      // Shuffle last 30% of non-blank hosts (keep most constrained at top)
-      const shuffleStartHost = Math.floor(nonBlankHosts.length * 0.7);
-      const hostsToShuffle = nonBlankHosts.splice(shuffleStartHost);
-      shuffleArray(hostsToShuffle);
-      nonBlankHosts.push(...hostsToShuffle);
-
-      // Reconstruct hosts array: non-blanks first, blanks at end
-      arrHosts.length = 0;
-      arrHosts.push(...nonBlankHosts, ...blankHosts);
-
-      // Separate non-blank and blank guests
-      const nonBlankGuests = [];
-      const blankGuests = [];
-      for (let i = 0; i < arrGuests.length; i++) {
-        if (arrGuests[i][GUEST_COLUMNS.CODE] && arrGuests[i][GUEST_COLUMNS.CODE].toString().length > 0) {
-          nonBlankGuests.push(arrGuests[i]);
-        } else {
-          blankGuests.push(arrGuests[i]);
-        }
-      }
-
-      // Shuffle last 30% of non-blank guests (keep most constrained at top)
-      const shuffleStartGuest = Math.floor(nonBlankGuests.length * 0.7);
-      const guestsToShuffle = nonBlankGuests.splice(shuffleStartGuest);
-      shuffleArray(guestsToShuffle);
-      nonBlankGuests.push(...guestsToShuffle);
-
-      // Reconstruct guests array: non-blanks first, blanks at end
-      arrGuests.length = 0;
-      arrGuests.push(...nonBlankGuests, ...blankGuests);
-    }
-
-    // Count how many guests to process to ignore blank rows
-    for (let i = 0; i < arrGuests.length; i++) {
-      if (arrGuests[i][GUEST_COLUMNS.CODE].length > 0) {
-        countGuests++;
-      }
-    }
-
-    // Check control flags, clear the seated flag and the Grid if requested
-    if (ctrlClearSeated === 1) {
-      for (let i = 0; i < countGuests; i++) {
-        arrGuests[i][GUEST_COLUMNS.SEATED] = "No";
-      }
-    }
-
-    if (ctrlClearGrid === 1) {
-      for (let i = 0; i < arrGrid.length; i++) {
-        for (let j = 0; j <= GRID_COLUMNS.GUEST_5; j++) {
-          arrGrid[i][j] = null;
-        }
-      }
-    }
-
-  // CREATE THE GRID
-  for (let i = 0; i < arrHosts.length; i++) {
-    let seatedCount;
-    let arrHouse;
-
-    if (arrGrid[i][GRID_COLUMNS.HOUSE] === null) {
-      // Initialize the House on first loop
-      arrGrid[i][GRID_COLUMNS.HOUSE] = i + 1;
-      arrGrid[i][GRID_COLUMNS.SEATS] = arrHosts[i][HOST_COLUMNS.SEATS];
-      arrGrid[i][GRID_COLUMNS.HOST] = arrHosts[i][HOST_COLUMNS.CODE];
-      seatedCount = Number(arrHosts[i][HOST_COLUMNS.COUNT]);
-
-      arrHouse = [];
-      arrHouse.push(arrGrid[i][GRID_COLUMNS.HOST]);
-    } else {
-      // The Grid already has data stored. Load that data into the variables used for processing
-      arrHouse = [];
-      for (let n = GRID_COLUMNS.HOST; n <= GRID_COLUMNS.GUEST_5; n++) {
-        if (arrGrid[i][n] !== null) {
-          arrHouse.push(arrGrid[i][n]);
-        }
-      }
-      seatedCount = arrGrid[i][GRID_COLUMNS.SEATED];
-    }
-    // Fill the house - with up to 5 guests or until seats are full
-    let gCount = arrHouse.length;
-    while (gCount < 5 && seatedCount < arrHosts[i][HOST_COLUMNS.SEATS]) {
-      let guestWasSeated = false;
-
-      for (let gRow = 0; gRow < countGuests; gRow++) {
-        if (ctrlThrottleSingles === 1 && arrGuests[gRow][GUEST_COLUMNS.COUNT] === 1 && gCount < 2) {
-          continue;
-        }
-        if (arrGuests[gRow][GUEST_COLUMNS.SEATED] === "No" &&
-            seatedCount + arrGuests[gRow][GUEST_COLUMNS.COUNT] <= arrHosts[i][HOST_COLUMNS.SEATS]) {
-
-          const compatibilityChecks = [];
-
-          // Check this guest against all current members in the house
-          for (let h = 0; h < gCount; h++) {
-            compatibilityChecks.push(memberMatch(
-              `${arrGuests[gRow][GUEST_COLUMNS.CODE]}-${arrHouse[h]}`,
-              ctrlTimeLapse,
-              connectionsMap,
-              setNeverMatch
-            ));
-          }
-
-          if (compatibilityChecks.every(check => check === true)) {
-            arrHouse.push(arrGuests[gRow][GUEST_COLUMNS.CODE]);
-            arrGuests[gRow][GUEST_COLUMNS.SEATED] = null;
-            seatedCount = seatedCount + Number(arrGuests[gRow][GUEST_COLUMNS.COUNT]);
-            gCount++;
-            guestWasSeated = true;
-            break;
-          }
-        }
-      }
-
-      if (!guestWasSeated) {
-        break;
-      }
-    }
-
-    // The house is finished. Add the values to arrGrid with bounds checking
-    arrGrid[i][GRID_COLUMNS.SEATED] = seatedCount;
-    for (let j = 0; j < 6; j++) {
-      arrGrid[i][GRID_COLUMNS.HOST + j] = arrHouse[j] || null;
     }
   }
 
-    // Count unseated guests for this attempt
-    let unseatedCount = 0;
-    for (let i = 0; i < arrGuests.length; i++) {
-      if (arrGuests[i][GUEST_COLUMNS.CODE] &&
-          arrGuests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
-          arrGuests[i][GUEST_COLUMNS.SEATED] === "No") {
-        unseatedCount++;
+  // Initialize grid with hosts
+  for (let i = 0; i < finalHosts.length; i++) {
+    if (finalHosts[i][HOST_COLUMNS.CODE]) {
+      finalGrid[i][GRID_COLUMNS.HOUSE] = i + 1;
+      finalGrid[i][GRID_COLUMNS.SEATS] = finalHosts[i][HOST_COLUMNS.SEATS];
+      finalGrid[i][GRID_COLUMNS.HOST] = finalHosts[i][HOST_COLUMNS.CODE];
+      finalGrid[i][GRID_COLUMNS.SEATED] = finalHosts[i][HOST_COLUMNS.COUNT];
+    }
+  }
+
+  // PLACE GUESTS - Simple iteration over guest list
+  for (let guestIdx = 0; guestIdx < finalGuests.length; guestIdx++) {
+    const guestCode = finalGuests[guestIdx][GUEST_COLUMNS.CODE];
+    if (!guestCode || guestCode.toString().length === 0) continue;
+
+    // Skip if already seated
+    if (finalGuests[guestIdx][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+    const guestCount = finalGuests[guestIdx][GUEST_COLUMNS.COUNT];
+    let bestHouseIdx = -1;
+    let bestHouseScore = -Infinity;
+
+    // Try each house and score it for this guest
+    for (let h = 0; h < finalGrid.length; h++) {
+      const hostCode = finalGrid[h][GRID_COLUMNS.HOST];
+      if (!hostCode) continue;
+
+      const houseSeats = finalGrid[h][GRID_COLUMNS.SEATS];
+      const houseSeated = finalGrid[h][GRID_COLUMNS.SEATED];
+      const houseMembers = getHouseMembers(finalGrid[h]);
+
+      // Check capacity
+      if (houseSeated + guestCount > houseSeats) continue;
+
+      // Check if slot available (max 6 members)
+      if (houseMembers.length >= 6) continue;
+
+      // Check compatibility with ALL current members
+      let isCompatible = true;
+      for (let m = 0; m < houseMembers.length; m++) {
+        const pairKey = `${guestCode}-${houseMembers[m]}`;
+        if (!memberMatch(pairKey, ctrlTimeLapse, connectionsMap, setNeverMatch)) {
+          isCompatible = false;
+          break;
+        }
+      }
+
+      if (!isCompatible) continue;
+
+      // Score this house for this guest
+      let score = 0;
+
+      // Factor 1: Prefer houses with more space remaining (save tight houses for tight guests)
+      const spaceRemaining = houseSeats - houseSeated;
+      score += spaceRemaining * 5;
+
+      // Factor 2: Prefer houses with fewer current members (distribute evenly)
+      score += (6 - houseMembers.length) * 10;
+
+      // Factor 3: Connection quality bonus
+      let totalMonthsApart = 0;
+      for (let m = 0; m < houseMembers.length; m++) {
+        const pairKey = `${guestCode}-${houseMembers[m]}`;
+        const connection = connectionsMap[pairKey];
+        // Enhanced map always has entries (999 for never met)
+        totalMonthsApart += connection.monthsApart;
+      }
+      score += totalMonthsApart / 10;
+
+      if (score > bestHouseScore) {
+        bestHouseScore = score;
+        bestHouseIdx = h;
       }
     }
 
-    // Track best result
-    if (unseatedCount < bestUnseatedCount) {
-      bestUnseatedCount = unseatedCount;
-      bestGrid = arrGrid.map(row => [...row]);
-      bestGuests = arrGuests.map(row => [...row]);
-
-      // If we found a perfect solution, stop trying
-      if (unseatedCount === 0) {
-        Logger.log(`Perfect solution found on attempt ${attemptNumber}`);
-        break;
+    // Place guest in best house found
+    if (bestHouseIdx !== -1) {
+      const slot = findNullSlotInHouse(finalGrid[bestHouseIdx], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+      if (slot !== -1) {
+        finalGrid[bestHouseIdx][slot] = guestCode;
+        finalGrid[bestHouseIdx][GRID_COLUMNS.SEATED] += guestCount;
+        finalGuests[guestIdx][GUEST_COLUMNS.SEATED] = null;
       }
     }
+  }
 
-    Logger.log(`Attempt ${attemptNumber}: ${unseatedCount} unseated`);
-  } // End random restart loop
+  // Count unseated
+  const unseatedCount = countUnseatedGuests(finalGuests);
+  Logger.log(`Phase 1 complete: ${unseatedCount} unseated`);
 
-  // Use the best result found
-  let finalGrid = bestGrid;
-  let finalGuests = bestGuests;
+  // PHASE 2 & 3: Apply existing swap optimization and constraint relaxation
+  if (unseatedCount > 0) {
+    Logger.log('\n========== UNSEATED GUEST DIAGNOSTIC ==========');
+    analyzeUnseatedGuests(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+    Logger.log('===============================================\n');
 
-  // PHASE 2: SWAP OPTIMIZATION
-  // Try to seat remaining unseated guests by swapping with seated guests
-  if (bestUnseatedCount > 0) {
-    Logger.log(`Starting Phase 2: Swap Optimization for ${bestUnseatedCount} unseated guests`);
-
-    const swapResult = attemptSwapOptimization(
-      finalGrid,
-      finalGuests,
-      ctrlTimeLapse,
-      connectionsMap,
-      setNeverMatch
-    );
-
+    Logger.log(`Starting Phase 2: Swap Optimization for ${unseatedCount} unseated guests`);
+    const swapResult = attemptSwapOptimization(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
     finalGrid = swapResult.grid;
     finalGuests = swapResult.guests;
 
-    const finalUnseatedCount = swapResult.unseatedCount;
-    Logger.log(`Phase 2 complete: ${finalUnseatedCount} unseated (reduced by ${bestUnseatedCount - finalUnseatedCount})`);
-  }
+    const phase2Unseated = swapResult.unseatedCount;
+    Logger.log(`Phase 2 complete: ${phase2Unseated} unseated (reduced by ${unseatedCount - phase2Unseated})`);
 
-  // CLEAN UP AND FINISH
-  // Write the completed arrGrid back to the sheet
-  finalGrid.splice(0, 0, headerGrid);
-  gridSheet.getRange('rangeGrid').setValues(finalGrid);
+    if (phase2Unseated > 0) {
+      Logger.log('\n========== REMAINING UNSEATED AFTER PHASE 2 ==========');
+      analyzeUnseatedGuests(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+      Logger.log('======================================================\n');
 
-  // Remove the column added for sorting before writing back to the sheet
-  if (ctrlSortGuests === 1) {
-    for (let i = 0; i < finalGuests.length; i++) {
-      if (finalGuests[i][GUEST_COLUMNS.CODE].length > 0) {
-        finalGuests[i].pop();
+      Logger.log(`\nStarting Phase 3: Selective Constraint Relaxation for ${phase2Unseated} unseated guests`);
+      const relaxResult = attemptConstraintRelaxation(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+      finalGrid = relaxResult.grid;
+      finalGuests = relaxResult.guests;
+
+      const phase3Unseated = relaxResult.unseatedCount;
+      Logger.log(`Phase 3 complete: ${phase3Unseated} unseated (seated ${relaxResult.guestsSeated} with relaxed constraints)`);
+
+      if (phase3Unseated > 0) {
+        Logger.log('\n========== FINAL UNSEATED ANALYSIS ==========');
+        analyzeUnseatedGuests(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+        Logger.log('=============================================\n');
       }
     }
   }
 
-  // Write the arrGuests back to the sheet
-  finalGuests.splice(0, 0, headerGuests);
-  gridSheet.getRange('rangeGuests').setValues(finalGuests);
+  // CLEANUP (same as buildGrid)
+  finalGrid.splice(0, 0, headerGrid);
+  gridRange.setValues(finalGrid);
 
-  // Report unseated members with attempt info
-  Logger.log(`Best result: ${bestUnseatedCount} unseated guests after ${attemptNumber} attempts`);
+  finalGuests.splice(0, 0, headerGuests);
+  guestsRange.setValues(finalGuests);
+
   reportUnseatedMembers(finalGuests, GUEST_COLUMNS.CODE, GUEST_COLUMNS.SEATED);
 }
+
 /** HELPER FUNCTIONS */
 
+/**
+ * Separates an array into non-blank and blank rows based on a code column
+ * @param {Array} array - Array to separate
+ * @param {number} codeColumn - Column index to check for blank values
+ * @returns {Object} Object with nonBlank and blank arrays
+ */
+function separateBlankRows(array, codeColumn) {
+  const nonBlank = [];
+  const blank = [];
+
+  for (let i = 0; i < array.length; i++) {
+    if (array[i][codeColumn] && array[i][codeColumn].toString().length > 0) {
+      nonBlank.push(array[i]);
+    } else {
+      blank.push(array[i]);
+    }
+  }
+
+  return { nonBlank, blank };
+}
+
+/**
+ * Collects all member codes from a grid row (host and guests)
+ * @param {Array} gridRow - Single row from the grid
+ * @returns {Array} Array of member codes
+ */
+function getHouseMembers(gridRow) {
+  const members = [];
+  for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
+    if (gridRow[j]) {
+      members.push(gridRow[j]);
+    }
+  }
+  return members;
+}
+
+/**
+ * Counts unseated guests in the guests array
+ * @param {Array} guestsArray - Array of guests with seated status
+ * @returns {number} Count of unseated guests
+ */
+function countUnseatedGuests(guestsArray) {
+  let count = 0;
+  for (let i = 0; i < guestsArray.length; i++) {
+    if (guestsArray[i][GUEST_COLUMNS.CODE] &&
+        guestsArray[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        guestsArray[i][GUEST_COLUMNS.SEATED] === "No") {
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * Look-Ahead Blocking Detection
+ * Checks if placing a guest in a house would eliminate critical options for other highly constrained guests
+ * @param {Object} guestToPlace - Guest being considered for placement {code, count, compatibleHouses}
+ * @param {number} houseIdx - Index of house being considered
+ * @param {Array} grid - Current grid state
+ * @param {Array} guestConstraints - Array of all guest constraint objects
+ * @param {Array} guestsArray - Full guests array to check seated status
+ * @param {number} timeLapse - Time-lapse threshold for compatibility
+ * @param {Object} connectionsMap - Map of connections
+ * @param {Set} setNeverMatch - Set of never-match pairs
+ * @returns {boolean} True if placement would block a critical guest
+ */
+function wouldBlockCriticalGuest(guestToPlace, houseIdx, grid, guestConstraints, guestsArray, timeLapse, connectionsMap, setNeverMatch) {
+  // Only check for guests with very limited options (≤ LOOKAHEAD_CRITICAL_THRESHOLD compatible houses)
+  const CRITICAL_THRESHOLD = LOOKAHEAD_CRITICAL_THRESHOLD;
+
+  // Get the house details after hypothetical placement
+  const houseSeats = grid[houseIdx][GRID_COLUMNS.SEATS];
+  const currentSeated = grid[houseIdx][GRID_COLUMNS.SEATED];
+  const newSeatedCount = currentSeated + guestToPlace.count;
+  const houseMembersAfterPlacement = getHouseMembers(grid[houseIdx]);
+  houseMembersAfterPlacement.push(guestToPlace.code);
+
+  // Check each other unseated guest
+  for (let i = 0; i < guestConstraints.length; i++) {
+    const otherGuest = guestConstraints[i];
+
+    // Skip if it's the same guest we're placing
+    if (otherGuest.code === guestToPlace.code) continue;
+
+    // Skip if already seated
+    if (guestsArray[otherGuest.index][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+    // Only care about critically constrained guests
+    if (otherGuest.compatibleHouses > CRITICAL_THRESHOLD) continue;
+
+    // Check if this house is currently compatible for the other guest
+    // (before we place guestToPlace)
+    let wasCompatibleBefore = true;
+    const currentHouseMembers = getHouseMembers(grid[houseIdx]);
+
+    // Check capacity before placement
+    if (currentSeated + otherGuest.count > houseSeats) {
+      wasCompatibleBefore = false;
+    }
+
+    // Check member compatibility before placement
+    if (wasCompatibleBefore) {
+      for (let m = 0; m < currentHouseMembers.length; m++) {
+        const pairKey = `${otherGuest.code}-${currentHouseMembers[m]}`;
+        if (!memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+          wasCompatibleBefore = false;
+          break;
+        }
+      }
+    }
+
+    // If house wasn't compatible before, it's not a blocking issue
+    if (!wasCompatibleBefore) continue;
+
+    // Now check if placing guestToPlace would make it incompatible
+    let wouldBeCompatibleAfter = true;
+
+    // Check capacity after placement
+    if (newSeatedCount + otherGuest.count > houseSeats) {
+      wouldBeCompatibleAfter = false;
+    }
+
+    // Check member compatibility after placement (including with guestToPlace)
+    if (wouldBeCompatibleAfter) {
+      for (let m = 0; m < houseMembersAfterPlacement.length; m++) {
+        const pairKey = `${otherGuest.code}-${houseMembersAfterPlacement[m]}`;
+        if (!memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+          wouldBeCompatibleAfter = false;
+          break;
+        }
+      }
+    }
+
+    // Check slot availability after placement (max 6 members)
+    if (wouldBeCompatibleAfter && houseMembersAfterPlacement.length >= 6) {
+      wouldBeCompatibleAfter = false;
+    }
+
+    // If placement would remove a compatible option from a critical guest, block it
+    if (wasCompatibleBefore && !wouldBeCompatibleAfter) {
+      Logger.log(`  ⚠️ Look-ahead: Placing ${guestToPlace.code} in house ${houseIdx + 1} would block critical guest ${otherGuest.code} (${otherGuest.compatibleHouses} options)`);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Builds a bidirectional Set of never-match pairs from array
+ * @param {Array} neverMatchArray - Array of never-match pairs (already has header removed)
+ * @returns {Set} Set containing both directions of each pair
+ */
+function buildNeverMatchSet(neverMatchArray) {
+  const setNeverMatch = new Set();
+
+  for (let i = 0; i < neverMatchArray.length; i++) {
+    if (neverMatchArray[i][0] && neverMatchArray[i][0].toString().length > 0) {
+      const pair = neverMatchArray[i][0].toString();
+      setNeverMatch.add(pair);
+
+      // Add reverse pair
+      const parts = pair.split('-');
+      if (parts.length === 2) {
+        setNeverMatch.add(`${parts[1]}-${parts[0]}`);
+      }
+    }
+  }
+
+  return setNeverMatch;
+}
+
+/**
+ * Returns background and font colors for months apart value
+ * @param {number|string} monthsValue - Months apart or 'Never met'
+ * @returns {Object} Object with background and fontColor properties
+ */
+function getMonthsApartColors(monthsValue) {
+  if (monthsValue === 'Never met') {
+    return { background: '#cfe2f3', fontColor: '#1155cc' };
+  } else if (typeof monthsValue === 'number') {
+    if (monthsValue <= 6) {
+      return { background: '#f4cccc', fontColor: '#cc0000' };
+    } else if (monthsValue <= 12) {
+      return { background: '#fff2cc', fontColor: '#bf9000' };
+    } else {
+      return { background: '#d9ead3', fontColor: '#38761d' };
+    }
+  }
+  // Subtotal or other non-numeric
+  return { background: '#d9d9d9', fontColor: '#000000' };
+}
+
+/**
+ * Finds the first null slot in a grid row between start and end columns
+ * @param {Array} gridRow - Grid row to search
+ * @param {number} startCol - Starting column index
+ * @param {number} endCol - Ending column index
+ * @returns {number} Column index of first null, or -1 if none found
+ */
+function findNullSlotInHouse(gridRow, startCol, endCol) {
+  for (let j = startCol; j <= endCol; j++) {
+    if (gridRow[j] === null) {
+      return j;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Scores a guest for placement in a house. Higher score = better candidate.
+ * Scoring considers: constraint level, compatibility quality, party size balance
+ * @param {Object} guestInfo - Object with guest details
+ * @param {Array} houseMembers - Current members in the house
+ * @param {Object} connectionsMap - Map of all connections
+ * @param {Object} connectionCounts - Map of connection counts per member
+ * @param {number} houseSpotsRemaining - Available spots in house
+ * @param {number} totalUnseatableGuests - Count of guests still unseated
+ * @param {Object} criticalGuestMap - Map of guest code -> compatible house count
+ * @returns {number} Score for this guest (higher is better)
+ */
+function scoreGuestForHouse(guestInfo, houseMembers, connectionsMap, connectionCounts, houseSpotsRemaining, totalUnseatedGuests, criticalGuestMap) {
+  let score = 0;
+
+  // 0. CRITICAL GUEST PRIORITY: Guests with very few compatible houses MUST be seated first!
+  const compatibleHouseCount = criticalGuestMap[guestInfo.code] || 999;
+  if (compatibleHouseCount <= 1) {
+    score += 500; // CRITICAL: Only 1 house option - must seat now!
+  } else if (compatibleHouseCount <= 2) {
+    score += 300; // Very constrained - high priority
+  } else if (compatibleHouseCount <= 3) {
+    score += 150; // Constrained - elevated priority
+  } else if (compatibleHouseCount <= 5) {
+    score += 50; // Somewhat constrained
+  }
+
+  // 1. Constraint Priority: More connections = harder to place = higher priority
+  const guestConnectionCount = connectionCounts[guestInfo.code] || 0;
+  score += guestConnectionCount * 10; // Weight: 10 points per connection
+
+  // 2. Compatibility Quality: Fewer shared connections with house = better (saves flexibility)
+  let sharedConnectionScore = 0;
+  for (let i = 0; i < houseMembers.length; i++) {
+    const pairKey = `${guestInfo.code}-${houseMembers[i]}`;
+    const connection = connectionsMap[pairKey];
+    if (connection) {
+      const monthsApart = connection[CONNECTION_COLUMNS.MONTHS_APART];
+      // Prefer guests who met longer ago (more flexibility for future)
+      sharedConnectionScore += Math.min(monthsApart, 24); // Cap at 24 months
+    } else {
+      // Never met = excellent fit
+      sharedConnectionScore += 30;
+    }
+  }
+  score += sharedConnectionScore;
+
+  // 3. Party Size Efficiency: Prefer guests that fit well in remaining space
+  const spotsAfterSeating = houseSpotsRemaining - guestInfo.count;
+  if (spotsAfterSeating >= 0) {
+    // Bonus for filling house efficiently
+    if (spotsAfterSeating === 0) {
+      score += 50; // Perfect fit - fills house completely
+    } else if (spotsAfterSeating === 1) {
+      score += 30; // Good fit - leaves room for singles
+    } else if (spotsAfterSeating <= 2) {
+      score += 20; // Decent fit
+    } else {
+      score += 10; // Leaves lots of space, but okay
+    }
+  }
+
+  // 4. Singles Consideration: Slight penalty for singles in early positions
+  // But don't block completely - just deprioritize
+  if (guestInfo.count === 1 && houseMembers.length < 2) {
+    score -= 15; // Small penalty for singles being early
+  }
+
+  // 5. Urgency: Boost score if few unseated guests remain (don't be too picky)
+  if (totalUnseatedGuests <= 5) {
+    score += 25; // Be more flexible near the end
+  }
+
+  return score;
+}
+
+/**
+ * Analyzes guests to identify "critical" guests with very few compatible house options
+ * Critical guests should be seated first before their options disappear
+ * @param {Array} guests - Array of guest data
+ * @param {Array} hosts - Array of host data
+ * @param {number} timeLapse - Time lapse threshold
+ * @param {Object} connectionsMap - Map of all connections
+ * @param {Set} setNeverMatch - Set of never-match pairs
+ * @returns {Object} Map of guest code -> number of compatible houses
+ */
+function analyzeCriticalGuests(guests, hosts, timeLapse, connectionsMap, setNeverMatch) {
+  const guestCompatibilityCount = {};
+
+  // For each unseated guest, count how many houses they can fit in
+  for (let gIdx = 0; gIdx < guests.length; gIdx++) {
+    if (!guests[gIdx][GUEST_COLUMNS.CODE] || guests[gIdx][GUEST_COLUMNS.CODE].toString().length === 0) continue;
+    if (guests[gIdx][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+    const guestCode = guests[gIdx][GUEST_COLUMNS.CODE];
+    const guestCount = guests[gIdx][GUEST_COLUMNS.COUNT];
+    let compatibleHouses = 0;
+
+    // Check compatibility with each host
+    for (let hIdx = 0; hIdx < hosts.length; hIdx++) {
+      if (!hosts[hIdx][HOST_COLUMNS.CODE] || hosts[hIdx][HOST_COLUMNS.CODE] < 1) continue;
+
+      const hostCode = hosts[hIdx][HOST_COLUMNS.CODE];
+      const hostSeats = hosts[hIdx][HOST_COLUMNS.SEATS];
+      const hostCount = hosts[hIdx][HOST_COLUMNS.COUNT];
+
+      // Check if guest fits in house (capacity)
+      if (guestCount + hostCount > hostSeats) continue;
+
+      // Check if guest is compatible with host
+      const pairKey = `${guestCode}-${hostCode}`;
+      if (memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+        compatibleHouses++;
+      }
+    }
+
+    guestCompatibilityCount[guestCode] = compatibleHouses;
+  }
+
+  return guestCompatibilityCount;
+}
+
+// Diagnostic function to analyze why guests are unseated
+function analyzeUnseatedGuests(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+  // Find all unseated guests
+  const unseatedGuests = [];
+  for (let i = 0; i < guests.length; i++) {
+    if (guests[i][GUEST_COLUMNS.CODE] &&
+        guests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        guests[i][GUEST_COLUMNS.SEATED] === "No") {
+      unseatedGuests.push({
+        index: i,
+        code: guests[i][GUEST_COLUMNS.CODE],
+        count: guests[i][GUEST_COLUMNS.COUNT],
+        name: guests[i][GUEST_COLUMNS.NAME] || guests[i][GUEST_COLUMNS.CODE]
+      });
+    }
+  }
+
+  Logger.log(`Total unseated guests: ${unseatedGuests.length}`);
+
+  // Analyze each unseated guest
+  for (let u = 0; u < unseatedGuests.length; u++) {
+    const guest = unseatedGuests[u];
+    Logger.log(`\nGuest ${u + 1}: ${guest.name} (${guest.code}), Party size: ${guest.count}`);
+
+    let compatibleHouseCount = 0;
+    const blockingReasons = {
+      capacity: [],
+      neverMatch: [],
+      timeLapse: [],
+      noSpace: []
+    };
+
+    // Check each house
+    for (let hIdx = 0; hIdx < grid.length; hIdx++) {
+      if (!grid[hIdx][GRID_COLUMNS.HOST]) continue;
+
+      const houseNum = hIdx + 1;
+      const houseSeats = grid[hIdx][GRID_COLUMNS.SEATS];
+      const houseSeated = grid[hIdx][GRID_COLUMNS.SEATED];
+      const houseMembers = getHouseMembers(grid[hIdx]);
+
+      // Check capacity
+      if (houseSeated + guest.count > houseSeats) {
+        blockingReasons.capacity.push(`House ${houseNum} (${houseSeated}/${houseSeats} seated, need ${guest.count} more)`);
+        continue;
+      }
+
+      // Check if there's actually a slot available (max 5 guests + 1 host)
+      if (houseMembers.length >= 6) {
+        blockingReasons.noSpace.push(`House ${houseNum} (already has ${houseMembers.length} members)`);
+        continue;
+      }
+
+      // Check compatibility with each member
+      let isCompatible = true;
+      let blockingMember = null;
+      let blockingReason = null;
+
+      for (let m = 0; m < houseMembers.length; m++) {
+        const memberCode = houseMembers[m];
+        const pairKey = `${guest.code}-${memberCode}`;
+
+        // Check never-match first
+        if (setNeverMatch.has(pairKey)) {
+          isCompatible = false;
+          blockingMember = memberCode;
+          blockingReason = 'never-match';
+          break;
+        }
+
+        // Check time-lapse
+        if (!memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+          isCompatible = false;
+          blockingMember = memberCode;
+          blockingReason = 'time-lapse';
+
+          // Get the actual connection date for more detail
+          const connection = connectionsMap[pairKey];
+          if (connection) {
+            blockingReason = `time-lapse (met ${connection.monthsApart} months ago, need ${timeLapse})`;
+          }
+          break;
+        }
+      }
+
+      if (isCompatible) {
+        compatibleHouseCount++;
+      } else {
+        if (blockingReason === 'never-match') {
+          blockingReasons.neverMatch.push(`House ${houseNum} (never-match with ${blockingMember})`);
+        } else if (blockingReason) {
+          blockingReasons.timeLapse.push(`House ${houseNum} (${blockingReason} with ${blockingMember})`);
+        }
+      }
+    }
+
+    Logger.log(`  Compatible houses: ${compatibleHouseCount}`);
+
+    if (compatibleHouseCount === 0) {
+      Logger.log(`  ⚠️ CRITICAL: No compatible houses found!`);
+    }
+
+    // Log blocking reasons
+    if (blockingReasons.capacity.length > 0) {
+      Logger.log(`  Blocked by CAPACITY (${blockingReasons.capacity.length} houses):`);
+      blockingReasons.capacity.slice(0, 3).forEach(reason => Logger.log(`    - ${reason}`));
+      if (blockingReasons.capacity.length > 3) {
+        Logger.log(`    ... and ${blockingReasons.capacity.length - 3} more`);
+      }
+    }
+
+    if (blockingReasons.neverMatch.length > 0) {
+      Logger.log(`  Blocked by NEVER-MATCH (${blockingReasons.neverMatch.length} houses):`);
+      blockingReasons.neverMatch.forEach(reason => Logger.log(`    - ${reason}`));
+    }
+
+    if (blockingReasons.timeLapse.length > 0) {
+      Logger.log(`  Blocked by TIME-LAPSE (${blockingReasons.timeLapse.length} houses):`);
+      blockingReasons.timeLapse.slice(0, 3).forEach(reason => Logger.log(`    - ${reason}`));
+      if (blockingReasons.timeLapse.length > 3) {
+        Logger.log(`    ... and ${blockingReasons.timeLapse.length - 3} more`);
+      }
+    }
+
+    if (blockingReasons.noSpace.length > 0) {
+      Logger.log(`  Blocked by NO SLOT (${blockingReasons.noSpace.length} houses):`);
+      blockingReasons.noSpace.slice(0, 3).forEach(reason => Logger.log(`    - ${reason}`));
+    }
+  }
+}
+
 function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
-  // Phase 2: Try to seat unseated guests by swapping with seated guests
+  // Phase 2: Enhanced multi-strategy swap optimization
+  const workingGrid = grid.map(row => [...row]);
+  const workingGuests = guests.map(row => [...row]);
+
+  let totalSwapsMade = 0;
+
+  // STRATEGY 1: Simple 1-for-1 swaps (original logic)
+  Logger.log('Phase 2.1: Attempting simple 1-for-1 swaps');
+  const result1 = attemptSimpleSwaps(workingGrid, workingGuests, timeLapse, connectionsMap, setNeverMatch);
+  totalSwapsMade += result1.swapsMade;
+
+  if (result1.unseatedCount === 0) {
+    Logger.log(`All guests seated after simple swaps`);
+    return result1;
+  }
+
+  // STRATEGY 2: 2-way swaps between seated guests
+  Logger.log(`Phase 2.2: Attempting 2-way swaps (${result1.unseatedCount} still unseated)`);
+  const result2 = attemptTwoWaySwaps(result1.grid, result1.guests, timeLapse, connectionsMap, setNeverMatch);
+  totalSwapsMade += result2.swapsMade;
+
+  if (result2.unseatedCount === 0) {
+    Logger.log(`All guests seated after 2-way swaps`);
+    return result2;
+  }
+
+  // STRATEGY 3: Chain swaps for remaining unseated guests
+  Logger.log(`Phase 2.3: Attempting chain swaps (${result2.unseatedCount} still unseated)`);
+  const result3 = attemptChainSwaps(result2.grid, result2.guests, timeLapse, connectionsMap, setNeverMatch);
+  totalSwapsMade += result3.swapsMade;
+
+  if (result3.unseatedCount === 0) {
+    Logger.log(`All guests seated after chain swaps`);
+    Logger.log(`Total swaps made: ${totalSwapsMade}`);
+    return result3;
+  }
+
+  // STRATEGY 4: Capacity Consolidation - redistribute singles to create space for couples
+  Logger.log(`Phase 2.4: Attempting capacity consolidation (${result3.unseatedCount} still unseated)`);
+  const result4 = attemptCapacityConsolidation(result3.grid, result3.guests, timeLapse, connectionsMap, setNeverMatch);
+  totalSwapsMade += result4.swapsMade;
+
+  Logger.log(`Total swaps made: ${totalSwapsMade}, Final unseated: ${result4.unseatedCount}`);
+  return result4;
+}
+
+// STRATEGY 1: Simple 1-for-1 swaps
+function attemptSimpleSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
   const workingGrid = grid.map(row => [...row]);
   const workingGuests = guests.map(row => [...row]);
 
@@ -517,12 +973,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
       const houseSeated = workingGrid[houseIdx][GRID_COLUMNS.SEATED];
 
       // Get all members currently in this house
-      const houseMembers = [];
-      for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
-        if (workingGrid[houseIdx][j]) {
-          houseMembers.push(workingGrid[houseIdx][j]);
-        }
-      }
+      const houseMembers = getHouseMembers(workingGrid[houseIdx]);
 
       // Try swapping with each seated guest in this house (except host)
       for (let m = 1; m < houseMembers.length && !wasSeated; m++) {
@@ -567,24 +1018,16 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
         let seatedGuestReseated = false;
 
         for (let otherHouseIdx = 0; otherHouseIdx < workingGrid.length && !seatedGuestReseated; otherHouseIdx++) {
-          if (otherHouseIdx === houseIdx) continue; // Can't put them in same house
+          if (otherHouseIdx === houseIdx) continue;
           if (!workingGrid[otherHouseIdx][GRID_COLUMNS.HOST]) continue;
 
           const otherSeats = workingGrid[otherHouseIdx][GRID_COLUMNS.SEATS];
           const otherSeated = workingGrid[otherHouseIdx][GRID_COLUMNS.SEATED];
 
-          // Check if seated guest fits
           if (otherSeated + seatedGuestCount > otherSeats) continue;
 
-          // Get members in other house
-          const otherMembers = [];
-          for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
-            if (workingGrid[otherHouseIdx][j]) {
-              otherMembers.push(workingGrid[otherHouseIdx][j]);
-            }
-          }
+          const otherMembers = getHouseMembers(workingGrid[otherHouseIdx]);
 
-          // Check if seated guest is compatible with other house
           let seatedFitsOther = true;
           for (let h = 0; h < otherMembers.length; h++) {
             if (!memberMatch(
@@ -599,8 +1042,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
           }
 
           if (seatedFitsOther) {
-            // Perform the swap!
-            // Remove seated guest from original house
+            // Perform the swap
             for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
               if (workingGrid[houseIdx][j] === seatedGuestCode) {
                 workingGrid[houseIdx][j] = null;
@@ -609,54 +1051,724 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
             }
             workingGrid[houseIdx][GRID_COLUMNS.SEATED] = houseSeated - seatedGuestCount;
 
-            // Add unseated guest to original house
-            for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
-              if (workingGrid[houseIdx][j] === null) {
-                workingGrid[houseIdx][j] = unseatedGuest.code;
-                break;
-              }
+            const slotForUnseated = findNullSlotInHouse(workingGrid[houseIdx], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slotForUnseated !== -1) {
+              workingGrid[houseIdx][slotForUnseated] = unseatedGuest.code;
             }
             workingGrid[houseIdx][GRID_COLUMNS.SEATED] = workingGrid[houseIdx][GRID_COLUMNS.SEATED] + unseatedGuest.count;
 
-            // Add seated guest to other house
-            for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
-              if (workingGrid[otherHouseIdx][j] === null) {
-                workingGrid[otherHouseIdx][j] = seatedGuestCode;
-                break;
-              }
+            const slotForSeated = findNullSlotInHouse(workingGrid[otherHouseIdx], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slotForSeated !== -1) {
+              workingGrid[otherHouseIdx][slotForSeated] = seatedGuestCode;
             }
             workingGrid[otherHouseIdx][GRID_COLUMNS.SEATED] = otherSeated + seatedGuestCount;
 
-            // Update guest statuses
             workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] = null;
 
             seatedGuestReseated = true;
             wasSeated = true;
             swapsMade++;
 
-            Logger.log(`Swap: ${unseatedGuest.code} into house ${houseIdx + 1}, ${seatedGuestCode} moved to house ${otherHouseIdx + 1}`);
+            Logger.log(`Simple swap: ${unseatedGuest.code} into house ${houseIdx + 1}, ${seatedGuestCode} to house ${otherHouseIdx + 1}`);
           }
         }
       }
     }
   }
 
-  // Count remaining unseated
-  let unseatedCount = 0;
+  return {
+    grid: workingGrid,
+    guests: workingGuests,
+    unseatedCount: countUnseatedGuests(workingGuests),
+    swapsMade: swapsMade
+  };
+}
+
+// STRATEGY 2: 2-way swaps - swap two seated guests between houses
+function attemptTwoWaySwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+  const workingGrid = grid.map(row => [...row]);
+  const workingGuests = guests.map(row => [...row]);
+  let swapsMade = 0;
+
+  // Find unseated guests
+  const unseatedGuests = [];
   for (let i = 0; i < workingGuests.length; i++) {
     if (workingGuests[i][GUEST_COLUMNS.CODE] &&
         workingGuests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
         workingGuests[i][GUEST_COLUMNS.SEATED] === "No") {
-      unseatedCount++;
+      unseatedGuests.push({
+        index: i,
+        code: workingGuests[i][GUEST_COLUMNS.CODE],
+        count: workingGuests[i][GUEST_COLUMNS.COUNT]
+      });
     }
   }
 
-  Logger.log(`Swaps made: ${swapsMade}`);
+  if (unseatedGuests.length === 0) {
+    return {
+      grid: workingGrid,
+      guests: workingGuests,
+      unseatedCount: 0,
+      swapsMade: 0
+    };
+  }
+
+  // Try swapping seated guests between two houses to create space for unseated
+  for (let house1 = 0; house1 < workingGrid.length; house1++) {
+    if (!workingGrid[house1][GRID_COLUMNS.HOST]) continue;
+
+    const house1Members = getHouseMembers(workingGrid[house1]);
+
+    for (let house2 = house1 + 1; house2 < workingGrid.length; house2++) {
+      if (!workingGrid[house2][GRID_COLUMNS.HOST]) continue;
+
+      const house2Members = getHouseMembers(workingGrid[house2]);
+
+      // Try swapping each guest from house1 with each guest from house2
+      for (let g1 = 1; g1 < house1Members.length; g1++) { // Skip host (index 0)
+        const guest1Code = house1Members[g1];
+        const guest1Info = findGuestInfo(workingGuests, guest1Code);
+        if (!guest1Info) continue;
+
+        for (let g2 = 1; g2 < house2Members.length; g2++) { // Skip host
+          const guest2Code = house2Members[g2];
+          const guest2Info = findGuestInfo(workingGuests, guest2Code);
+          if (!guest2Info) continue;
+
+          // Check if swapping would maintain constraints
+          // Guest1 goes to house2, Guest2 goes to house1
+
+          // Check seats
+          const house1Seats = workingGrid[house1][GRID_COLUMNS.SEATS];
+          const house1Seated = workingGrid[house1][GRID_COLUMNS.SEATED];
+          const house2Seats = workingGrid[house2][GRID_COLUMNS.SEATS];
+          const house2Seated = workingGrid[house2][GRID_COLUMNS.SEATED];
+
+          const newHouse1Seated = house1Seated - guest1Info.count + guest2Info.count;
+          const newHouse2Seated = house2Seated - guest2Info.count + guest1Info.count;
+
+          if (newHouse1Seated > house1Seats || newHouse2Seated > house2Seats) continue;
+
+          // Check compatibility: guest1 with house2 members (excluding guest2)
+          let guest1FitsHouse2 = true;
+          for (let m = 0; m < house2Members.length; m++) {
+            if (house2Members[m] === guest2Code) continue;
+            if (!memberMatch(`${guest1Code}-${house2Members[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+              guest1FitsHouse2 = false;
+              break;
+            }
+          }
+
+          if (!guest1FitsHouse2) continue;
+
+          // Check compatibility: guest2 with house1 members (excluding guest1)
+          let guest2FitsHouse1 = true;
+          for (let m = 0; m < house1Members.length; m++) {
+            if (house1Members[m] === guest1Code) continue;
+            if (!memberMatch(`${guest2Code}-${house1Members[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+              guest2FitsHouse1 = false;
+              break;
+            }
+          }
+
+          if (!guest2FitsHouse1) continue;
+
+          // Check if this swap creates space for an unseated guest
+          let createsOpportunity = false;
+          for (let u = 0; u < unseatedGuests.length; u++) {
+            const unseatedGuest = unseatedGuests[u];
+
+            // Check if unseated can fit in house1 after swap
+            if (newHouse1Seated + unseatedGuest.count <= house1Seats) {
+              const house1AfterSwap = house1Members.filter(m => m !== guest1Code);
+              house1AfterSwap.push(guest2Code);
+
+              let unseatedFitsHouse1 = true;
+              for (let m = 0; m < house1AfterSwap.length; m++) {
+                if (!memberMatch(`${unseatedGuest.code}-${house1AfterSwap[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+                  unseatedFitsHouse1 = false;
+                  break;
+                }
+              }
+
+              if (unseatedFitsHouse1) {
+                createsOpportunity = true;
+                break;
+              }
+            }
+
+            // Check if unseated can fit in house2 after swap
+            if (newHouse2Seated + unseatedGuest.count <= house2Seats) {
+              const house2AfterSwap = house2Members.filter(m => m !== guest2Code);
+              house2AfterSwap.push(guest1Code);
+
+              let unseatedFitsHouse2 = true;
+              for (let m = 0; m < house2AfterSwap.length; m++) {
+                if (!memberMatch(`${unseatedGuest.code}-${house2AfterSwap[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+                  unseatedFitsHouse2 = false;
+                  break;
+                }
+              }
+
+              if (unseatedFitsHouse2) {
+                createsOpportunity = true;
+                break;
+              }
+            }
+          }
+
+          if (createsOpportunity) {
+            // Perform the 2-way swap
+            // Remove guest1 from house1
+            for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
+              if (workingGrid[house1][j] === guest1Code) {
+                workingGrid[house1][j] = null;
+                break;
+              }
+            }
+
+            // Remove guest2 from house2
+            for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
+              if (workingGrid[house2][j] === guest2Code) {
+                workingGrid[house2][j] = null;
+                break;
+              }
+            }
+
+            // Add guest2 to house1
+            const slot1 = findNullSlotInHouse(workingGrid[house1], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slot1 !== -1) workingGrid[house1][slot1] = guest2Code;
+
+            // Add guest1 to house2
+            const slot2 = findNullSlotInHouse(workingGrid[house2], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slot2 !== -1) workingGrid[house2][slot2] = guest1Code;
+
+            // Update seated counts
+            workingGrid[house1][GRID_COLUMNS.SEATED] = newHouse1Seated;
+            workingGrid[house2][GRID_COLUMNS.SEATED] = newHouse2Seated;
+
+            swapsMade++;
+            Logger.log(`2-way swap: ${guest1Code} (house ${house1 + 1}→${house2 + 1}) ↔ ${guest2Code} (house ${house2 + 1}→${house1 + 1})`);
+
+            // Now try to place an unseated guest in the newly opened spot
+            for (let u = 0; u < unseatedGuests.length; u++) {
+              const unseatedGuest = unseatedGuests[u];
+              if (workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+              // Try house1
+              if (workingGrid[house1][GRID_COLUMNS.SEATED] + unseatedGuest.count <= workingGrid[house1][GRID_COLUMNS.SEATS]) {
+                const h1Members = getHouseMembers(workingGrid[house1]);
+                let fits = true;
+                for (let m = 0; m < h1Members.length; m++) {
+                  if (!memberMatch(`${unseatedGuest.code}-${h1Members[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+                    fits = false;
+                    break;
+                  }
+                }
+
+                if (fits) {
+                  const slot = findNullSlotInHouse(workingGrid[house1], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+                  if (slot !== -1) {
+                    workingGrid[house1][slot] = unseatedGuest.code;
+                    workingGrid[house1][GRID_COLUMNS.SEATED] += unseatedGuest.count;
+                    workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] = null;
+                    Logger.log(`  → Seated ${unseatedGuest.code} in house ${house1 + 1}`);
+                    break;
+                  }
+                }
+              }
+
+              // Try house2
+              if (workingGrid[house2][GRID_COLUMNS.SEATED] + unseatedGuest.count <= workingGrid[house2][GRID_COLUMNS.SEATS]) {
+                const h2Members = getHouseMembers(workingGrid[house2]);
+                let fits = true;
+                for (let m = 0; m < h2Members.length; m++) {
+                  if (!memberMatch(`${unseatedGuest.code}-${h2Members[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+                    fits = false;
+                    break;
+                  }
+                }
+
+                if (fits) {
+                  const slot = findNullSlotInHouse(workingGrid[house2], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+                  if (slot !== -1) {
+                    workingGrid[house2][slot] = unseatedGuest.code;
+                    workingGrid[house2][GRID_COLUMNS.SEATED] += unseatedGuest.count;
+                    workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] = null;
+                    Logger.log(`  → Seated ${unseatedGuest.code} in house ${house2 + 1}`);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
   return {
     grid: workingGrid,
     guests: workingGuests,
-    unseatedCount: unseatedCount
+    unseatedCount: countUnseatedGuests(workingGuests),
+    swapsMade: swapsMade
+  };
+}
+
+// STRATEGY 3: Chain swaps - try relocating multiple guests to seat an unseated one
+function attemptChainSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+  const workingGrid = grid.map(row => [...row]);
+  const workingGuests = guests.map(row => [...row]);
+  let swapsMade = 0;
+
+  // Find unseated guests
+  const unseatedGuests = [];
+  for (let i = 0; i < workingGuests.length; i++) {
+    if (workingGuests[i][GUEST_COLUMNS.CODE] &&
+        workingGuests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        workingGuests[i][GUEST_COLUMNS.SEATED] === "No") {
+      unseatedGuests.push({
+        index: i,
+        code: workingGuests[i][GUEST_COLUMNS.CODE],
+        count: workingGuests[i][GUEST_COLUMNS.COUNT]
+      });
+    }
+  }
+
+  // For each unseated guest, try chain relocations
+  for (let u = 0; u < unseatedGuests.length; u++) {
+    const unseatedGuest = unseatedGuests[u];
+    if (workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+    // Try each house as a potential destination
+    for (let targetHouse = 0; targetHouse < workingGrid.length; targetHouse++) {
+      if (!workingGrid[targetHouse][GRID_COLUMNS.HOST]) continue;
+
+      const houseSeats = workingGrid[targetHouse][GRID_COLUMNS.SEATS];
+      const houseSeated = workingGrid[targetHouse][GRID_COLUMNS.SEATED];
+      const houseMembers = getHouseMembers(workingGrid[targetHouse]);
+
+      // If unseated fits directly, it would have been seated already, so skip
+      if (houseSeated + unseatedGuest.count <= houseSeats) {
+        let directFit = true;
+        for (let m = 0; m < houseMembers.length; m++) {
+          if (!memberMatch(`${unseatedGuest.code}-${houseMembers[m]}`, timeLapse, connectionsMap, setNeverMatch)) {
+            directFit = false;
+            break;
+          }
+        }
+        if (directFit) continue; // Should have been seated already
+      }
+
+      // Try removing each guest (except host) and see if unseated fits
+      for (let m = 1; m < houseMembers.length; m++) {
+        const blockingGuestCode = houseMembers[m];
+        const blockingGuestInfo = findGuestInfo(workingGuests, blockingGuestCode);
+        if (!blockingGuestInfo) continue;
+
+        // Check if removing this guest makes room
+        const seatsAfterRemoval = houseSeated - blockingGuestInfo.count;
+        if (seatsAfterRemoval + unseatedGuest.count > houseSeats) continue;
+
+        // Check if unseated fits with remaining members
+        let unseatedFits = true;
+        for (let h = 0; h < houseMembers.length; h++) {
+          if (houseMembers[h] === blockingGuestCode) continue;
+          if (!memberMatch(`${unseatedGuest.code}-${houseMembers[h]}`, timeLapse, connectionsMap, setNeverMatch)) {
+            unseatedFits = false;
+            break;
+          }
+        }
+
+        if (!unseatedFits) continue;
+
+        // Now find where to relocate the blocking guest (chain)
+        for (let newHouse = 0; newHouse < workingGrid.length; newHouse++) {
+          if (newHouse === targetHouse) continue;
+          if (!workingGrid[newHouse][GRID_COLUMNS.HOST]) continue;
+
+          const newHouseSeats = workingGrid[newHouse][GRID_COLUMNS.SEATS];
+          const newHouseSeated = workingGrid[newHouse][GRID_COLUMNS.SEATED];
+
+          if (newHouseSeated + blockingGuestInfo.count > newHouseSeats) continue;
+
+          const newHouseMembers = getHouseMembers(workingGrid[newHouse]);
+
+          let blockingFitsNew = true;
+          for (let h = 0; h < newHouseMembers.length; h++) {
+            if (!memberMatch(`${blockingGuestCode}-${newHouseMembers[h]}`, timeLapse, connectionsMap, setNeverMatch)) {
+              blockingFitsNew = false;
+              break;
+            }
+          }
+
+          if (blockingFitsNew) {
+            // Execute the chain swap
+            // Remove blocking guest from target house
+            for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
+              if (workingGrid[targetHouse][j] === blockingGuestCode) {
+                workingGrid[targetHouse][j] = null;
+                break;
+              }
+            }
+            workingGrid[targetHouse][GRID_COLUMNS.SEATED] -= blockingGuestInfo.count;
+
+            // Add blocking guest to new house
+            const slotForBlocking = findNullSlotInHouse(workingGrid[newHouse], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slotForBlocking !== -1) {
+              workingGrid[newHouse][slotForBlocking] = blockingGuestCode;
+            }
+            workingGrid[newHouse][GRID_COLUMNS.SEATED] += blockingGuestInfo.count;
+
+            // Add unseated guest to target house
+            const slotForUnseated = findNullSlotInHouse(workingGrid[targetHouse], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slotForUnseated !== -1) {
+              workingGrid[targetHouse][slotForUnseated] = unseatedGuest.code;
+            }
+            workingGrid[targetHouse][GRID_COLUMNS.SEATED] += unseatedGuest.count;
+
+            // Update guest status
+            workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] = null;
+
+            swapsMade++;
+            Logger.log(`Chain swap: ${blockingGuestCode} (house ${targetHouse + 1}→${newHouse + 1}), ${unseatedGuest.code} → house ${targetHouse + 1}`);
+
+            // Move to next unseated guest
+            break;
+          }
+        }
+
+        // If we seated this unseated guest, move to next one
+        if (workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] !== "No") break;
+      }
+
+      // If we seated this unseated guest, move to next one
+      if (workingGuests[unseatedGuest.index][GUEST_COLUMNS.SEATED] !== "No") break;
+    }
+  }
+
+  return {
+    grid: workingGrid,
+    guests: workingGuests,
+    unseatedCount: countUnseatedGuests(workingGuests),
+    swapsMade: swapsMade
+  };
+}
+
+// STRATEGY 4: Capacity Consolidation - move singles around to create space for couples
+function attemptCapacityConsolidation(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+  const workingGrid = grid.map(row => [...row]);
+  const workingGuests = guests.map(row => [...row]);
+  let swapsMade = 0;
+
+  // Find unseated guests
+  const unseatedGuests = [];
+  for (let i = 0; i < workingGuests.length; i++) {
+    if (workingGuests[i][GUEST_COLUMNS.CODE] &&
+        workingGuests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        workingGuests[i][GUEST_COLUMNS.SEATED] === "No") {
+      unseatedGuests.push({
+        index: i,
+        code: workingGuests[i][GUEST_COLUMNS.CODE],
+        count: workingGuests[i][GUEST_COLUMNS.COUNT],
+        name: workingGuests[i][GUEST_COLUMNS.NAME] || workingGuests[i][GUEST_COLUMNS.CODE]
+      });
+    }
+  }
+
+  if (unseatedGuests.length === 0) {
+    return {
+      grid: workingGrid,
+      guests: workingGuests,
+      unseatedCount: 0,
+      swapsMade: 0
+    };
+  }
+
+  // Calculate total capacity available
+  let totalCapacity = 0;
+  let totalSeated = 0;
+  for (let h = 0; h < workingGrid.length; h++) {
+    if (workingGrid[h][GRID_COLUMNS.HOST]) {
+      totalCapacity += workingGrid[h][GRID_COLUMNS.SEATS];
+      totalSeated += workingGrid[h][GRID_COLUMNS.SEATED];
+    }
+  }
+
+  const totalOpenSpots = totalCapacity - totalSeated;
+  let totalUnseatedCount = 0;
+  for (let u = 0; u < unseatedGuests.length; u++) {
+    totalUnseatedCount += unseatedGuests[u].count;
+  }
+
+  Logger.log(`Capacity check: ${totalOpenSpots} open spots, need ${totalUnseatedCount} spots`);
+
+  if (totalOpenSpots < totalUnseatedCount) {
+    Logger.log('Insufficient total capacity - cannot seat all guests');
+    return {
+      grid: workingGrid,
+      guests: workingGuests,
+      unseatedCount: countUnseatedGuests(workingGuests),
+      swapsMade: 0
+    };
+  }
+
+  // Focus on unseated couples (party size 2)
+  const unseatedCouples = unseatedGuests.filter(g => g.count === 2);
+
+  for (let u = 0; u < unseatedCouples.length; u++) {
+    const couple = unseatedCouples[u];
+    if (workingGuests[couple.index][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+    // Find houses with exactly 1 open spot that this couple could fit in (if they had 2 spots)
+    for (let targetHouse = 0; targetHouse < workingGrid.length; targetHouse++) {
+      if (!workingGrid[targetHouse][GRID_COLUMNS.HOST]) continue;
+
+      const houseSeats = workingGrid[targetHouse][GRID_COLUMNS.SEATS];
+      const houseSeated = workingGrid[targetHouse][GRID_COLUMNS.SEATED];
+      const spotsAvailable = houseSeats - houseSeated;
+
+      // Need exactly 1 spot free (will create 2nd spot by moving a single)
+      if (spotsAvailable !== 1) continue;
+
+      const houseMembers = getHouseMembers(workingGrid[targetHouse]);
+
+      // Check if couple would be compatible with this house (ignoring capacity for now)
+      let coupleCompatible = true;
+      for (let m = 0; m < houseMembers.length; m++) {
+        const pairKey = `${couple.code}-${houseMembers[m]}`;
+        if (!memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+          coupleCompatible = false;
+          break;
+        }
+      }
+
+      if (!coupleCompatible) continue;
+
+      // Find a single guest in this house to relocate
+      for (let m = 1; m < houseMembers.length; m++) { // Skip host (index 0)
+        const singleGuestCode = houseMembers[m];
+        const singleGuestInfo = findGuestInfo(workingGuests, singleGuestCode);
+
+        // Only move singles
+        if (!singleGuestInfo || singleGuestInfo.count !== 1) continue;
+
+        // Try to find a destination for this single
+        for (let destHouse = 0; destHouse < workingGrid.length; destHouse++) {
+          if (destHouse === targetHouse) continue;
+          if (!workingGrid[destHouse][GRID_COLUMNS.HOST]) continue;
+
+          const destSeats = workingGrid[destHouse][GRID_COLUMNS.SEATS];
+          const destSeated = workingGrid[destHouse][GRID_COLUMNS.SEATED];
+
+          // Check if single fits
+          if (destSeated + 1 > destSeats) continue;
+
+          const destMembers = getHouseMembers(workingGrid[destHouse]);
+
+          // Check if single is compatible with destination house
+          let singleFits = true;
+          for (let m = 0; m < destMembers.length; m++) {
+            const pairKey = `${singleGuestCode}-${destMembers[m]}`;
+            if (!memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+              singleFits = false;
+              break;
+            }
+          }
+
+          if (singleFits) {
+            // Execute the consolidation:
+            // 1. Remove single from target house
+            for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
+              if (workingGrid[targetHouse][j] === singleGuestCode) {
+                workingGrid[targetHouse][j] = null;
+                break;
+              }
+            }
+            workingGrid[targetHouse][GRID_COLUMNS.SEATED] -= 1;
+
+            // 2. Add single to destination house
+            const slotForSingle = findNullSlotInHouse(workingGrid[destHouse], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slotForSingle !== -1) {
+              workingGrid[destHouse][slotForSingle] = singleGuestCode;
+            }
+            workingGrid[destHouse][GRID_COLUMNS.SEATED] += 1;
+
+            // 3. Now target house has 2 spots - place the couple
+            const slot1 = findNullSlotInHouse(workingGrid[targetHouse], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+            if (slot1 !== -1) {
+              workingGrid[targetHouse][slot1] = couple.code;
+              workingGrid[targetHouse][GRID_COLUMNS.SEATED] += couple.count;
+              workingGuests[couple.index][GUEST_COLUMNS.SEATED] = null;
+
+              swapsMade++;
+              Logger.log(`Capacity consolidation: Moved ${singleGuestCode} (house ${targetHouse + 1}→${destHouse + 1}), seated ${couple.name} in house ${targetHouse + 1}`);
+
+              // Move to next unseated couple
+              break;
+            }
+          }
+        }
+
+        // If couple was seated, break out of single guest loop
+        if (workingGuests[couple.index][GUEST_COLUMNS.SEATED] !== "No") break;
+      }
+
+      // If couple was seated, break out of target house loop
+      if (workingGuests[couple.index][GUEST_COLUMNS.SEATED] !== "No") break;
+    }
+  }
+
+  return {
+    grid: workingGrid,
+    guests: workingGuests,
+    unseatedCount: countUnseatedGuests(workingGuests),
+    swapsMade: swapsMade
+  };
+}
+
+// Helper function to find guest info
+function findGuestInfo(guests, guestCode) {
+  for (let i = 0; i < guests.length; i++) {
+    if (guests[i][GUEST_COLUMNS.CODE] === guestCode) {
+      return {
+        index: i,
+        code: guestCode,
+        count: guests[i][GUEST_COLUMNS.COUNT]
+      };
+    }
+  }
+  return null;
+}
+
+// PHASE 3: Selective Constraint Relaxation
+// For guests with no compatible houses, progressively lower time-lapse constraint
+function attemptConstraintRelaxation(grid, guests, originalTimeLapse, connectionsMap, setNeverMatch) {
+  const workingGrid = grid.map(row => [...row]);
+  const workingGuests = guests.map(row => [...row]);
+  let guestsSeated = 0;
+
+  // Find unseated guests
+  const unseatedGuests = [];
+  for (let i = 0; i < workingGuests.length; i++) {
+    if (workingGuests[i][GUEST_COLUMNS.CODE] &&
+        workingGuests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        workingGuests[i][GUEST_COLUMNS.SEATED] === "No") {
+      unseatedGuests.push({
+        index: i,
+        code: workingGuests[i][GUEST_COLUMNS.CODE],
+        count: workingGuests[i][GUEST_COLUMNS.COUNT],
+        name: workingGuests[i][GUEST_COLUMNS.NAME] || workingGuests[i][GUEST_COLUMNS.CODE]
+      });
+    }
+  }
+
+  // Progressive thresholds to try (don't go below 12 months)
+  const thresholds = [24, 18, 12];
+
+  // For each unseated guest
+  for (let u = 0; u < unseatedGuests.length; u++) {
+    const guest = unseatedGuests[u];
+
+    // Check if already seated (may have been seated by previous guest's placement)
+    if (workingGuests[guest.index][GUEST_COLUMNS.SEATED] !== "No") continue;
+
+    // First, count compatible houses at original threshold
+    let compatibleAtOriginal = 0;
+    for (let hIdx = 0; hIdx < workingGrid.length; hIdx++) {
+      if (!workingGrid[hIdx][GRID_COLUMNS.HOST]) continue;
+
+      const houseSeats = workingGrid[hIdx][GRID_COLUMNS.SEATS];
+      const houseSeated = workingGrid[hIdx][GRID_COLUMNS.SEATED];
+      const houseMembers = getHouseMembers(workingGrid[hIdx]);
+
+      if (houseSeated + guest.count > houseSeats) continue;
+      if (houseMembers.length >= 6) continue;
+
+      let isCompatible = true;
+      for (let m = 0; m < houseMembers.length; m++) {
+        const pairKey = `${guest.code}-${houseMembers[m]}`;
+        if (!memberMatch(pairKey, originalTimeLapse, connectionsMap, setNeverMatch)) {
+          isCompatible = false;
+          break;
+        }
+      }
+
+      if (isCompatible) compatibleAtOriginal++;
+    }
+
+    // Only relax constraints for guests with 0 compatible houses
+    if (compatibleAtOriginal > 0) {
+      Logger.log(`Phase 3: ${guest.name} has ${compatibleAtOriginal} compatible house(s), skipping relaxation`);
+      continue;
+    }
+
+    Logger.log(`Phase 3: ${guest.name} has 0 compatible houses at ${originalTimeLapse} months, trying relaxed constraints...`);
+
+    // Try progressively lower thresholds
+    let wasSeated = false;
+    for (let t = 0; t < thresholds.length && !wasSeated; t++) {
+      const relaxedThreshold = thresholds[t];
+
+      // Try each house with relaxed constraint
+      for (let hIdx = 0; hIdx < workingGrid.length && !wasSeated; hIdx++) {
+        if (!workingGrid[hIdx][GRID_COLUMNS.HOST]) continue;
+
+        const houseNum = hIdx + 1;
+        const houseSeats = workingGrid[hIdx][GRID_COLUMNS.SEATS];
+        const houseSeated = workingGrid[hIdx][GRID_COLUMNS.SEATED];
+        const houseMembers = getHouseMembers(workingGrid[hIdx]);
+
+        // Check capacity
+        if (houseSeated + guest.count > houseSeats) continue;
+        if (houseMembers.length >= 6) continue;
+
+        // Check compatibility with relaxed time-lapse
+        let isCompatible = true;
+        for (let m = 0; m < houseMembers.length; m++) {
+          const pairKey = `${guest.code}-${houseMembers[m]}`;
+
+          // Never-match is still enforced
+          if (setNeverMatch.has(pairKey)) {
+            isCompatible = false;
+            break;
+          }
+
+          // Check with relaxed threshold
+          if (!memberMatch(pairKey, relaxedThreshold, connectionsMap, setNeverMatch)) {
+            isCompatible = false;
+            break;
+          }
+        }
+
+        if (isCompatible) {
+          // Seat the guest with relaxed constraint
+          const slot = findNullSlotInHouse(workingGrid[hIdx], GRID_COLUMNS.HOST, GRID_COLUMNS.GUEST_5);
+          if (slot !== -1) {
+            workingGrid[hIdx][slot] = guest.code;
+            workingGrid[hIdx][GRID_COLUMNS.SEATED] = houseSeated + guest.count;
+            workingGuests[guest.index][GUEST_COLUMNS.SEATED] = null;
+            wasSeated = true;
+            guestsSeated++;
+
+            Logger.log(`  ✓ Seated ${guest.name} in house ${houseNum} with ${relaxedThreshold}-month constraint (relaxed from ${originalTimeLapse})`);
+          }
+        }
+      }
+
+      if (wasSeated) break;
+    }
+
+    if (!wasSeated) {
+      Logger.log(`  ✗ Could not seat ${guest.name} even with relaxed constraints (12+ months)`);
+    }
+  }
+
+  return {
+    grid: workingGrid,
+    guests: workingGuests,
+    unseatedCount: countUnseatedGuests(workingGuests),
+    guestsSeated: guestsSeated
   };
 }
 
@@ -666,9 +1778,9 @@ function memberMatch(strToCheck, timeLapse, connectionsMap, setNeverMatch) {
     return false;
   }
 
-  // Check time-based constraints using Map (O(1) lookup instead of O(n))
-  const monthsApart = connectionsMap[strToCheck];
-  if (monthsApart !== undefined && timeLapse > monthsApart) {
+  // Check time-based constraints using enhanced connections map
+  const connection = connectionsMap[strToCheck];
+  if (connection && connection.isConstrained) {
     return false;
   }
 
@@ -876,18 +1988,7 @@ function auditGrid() {
   }
 
   // Create bidirectional Set for never-match pairs
-  const setNeverMatch = new Set();
-  for (let i = 0; i < arrNeverMatch.length; i++) {
-    if (arrNeverMatch[i][0] && arrNeverMatch[i][0].toString().length > 0) {
-      const pair = arrNeverMatch[i][0].toString();
-      setNeverMatch.add(pair);
-      // Add reverse pair
-      const parts = pair.split('-');
-      if (parts.length === 2) {
-        setNeverMatch.add([parts[1], parts[0]].join('-'));
-      }
-    }
-  }
+  const setNeverMatch = buildNeverMatchSet(arrNeverMatch);
 
   const auditData = [];
   const houseData = {}; // Track stats per house
@@ -903,11 +2004,7 @@ function auditGrid() {
   for (let i = 0; i < arrGrid.length; i++) {
     if (!arrGrid[i][GRID_COLUMNS.HOST]) continue;
 
-    const members = [];
-    for (let j = GRID_COLUMNS.HOST; j <= GRID_COLUMNS.GUEST_5; j++) {
-      if (arrGrid[i][j]) members.push(arrGrid[i][j]);
-    }
-
+    const members = getHouseMembers(arrGrid[i]);
     const houseNumber = i + 1;
     houseData[houseNumber] = {
       pairs: [],
@@ -986,7 +2083,7 @@ function auditGrid() {
   currentRow += 2;
 
   const summaryData = [
-    ['Total Connections:', totalConnections],
+    ['Total Prior Connections:', totalConnections],
     ['Never Met:', neverMetCount],
     ['Average Separation:', avgMonths + ' months'],
     ['Minimum Separation:', minMonths === Infinity ? 'N/A' : minMonths + ' months'],
@@ -1156,27 +2253,9 @@ function auditGrid() {
 
   for (let i = 0; i < values.length; i++) {
     const val = values[i][0];
-
-    // Skip subtotal rows
-    if (typeof val !== 'number' && val !== 'Never met') {
-      backgrounds.push(['#d9d9d9']);
-      fontColors.push(['#000000']);
-      continue;
-    }
-
-    if (val === 'Never met') {
-      backgrounds.push(['#cfe2f3']);
-      fontColors.push(['#1155cc']);
-    } else if (val <= 6) {
-      backgrounds.push(['#f4cccc']);
-      fontColors.push(['#cc0000']);
-    } else if (val <= 12) {
-      backgrounds.push(['#fff2cc']);
-      fontColors.push(['#bf9000']);
-    } else {
-      backgrounds.push(['#d9ead3']);
-      fontColors.push(['#38761d']);
-    }
+    const colors = getMonthsApartColors(val);
+    backgrounds.push([colors.background]);
+    fontColors.push([colors.fontColor]);
   }
 
   dataRange.setBackgrounds(backgrounds);
@@ -1264,20 +2343,9 @@ function auditGrid() {
 
     for (let i = 0; i < sortedValues.length; i++) {
       const val = sortedValues[i][0];
-
-      if (val === 'Never met') {
-        sortedBackgrounds.push(['#cfe2f3']);
-        sortedFontColors.push(['#1155cc']);
-      } else if (val <= 6) {
-        sortedBackgrounds.push(['#f4cccc']);
-        sortedFontColors.push(['#cc0000']);
-      } else if (val <= 12) {
-        sortedBackgrounds.push(['#fff2cc']);
-        sortedFontColors.push(['#bf9000']);
-      } else {
-        sortedBackgrounds.push(['#d9ead3']);
-        sortedFontColors.push(['#38761d']);
-      }
+      const colors = getMonthsApartColors(val);
+      sortedBackgrounds.push([colors.background]);
+      sortedFontColors.push([colors.fontColor]);
     }
 
     sortedMonthsRange.setBackgrounds(sortedBackgrounds);
