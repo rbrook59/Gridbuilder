@@ -177,6 +177,13 @@ function buildEnhancedConnectionsMap(guests, hosts, connectionsMap, timeLapse) {
   }
 
   // Build all pairs for tonight's attendees
+  const constraintCounts = {};
+
+  // Initialize constraint counts for all attendees
+  for (let i = 0; i < allAttendees.length; i++) {
+    constraintCounts[allAttendees[i]] = 0;
+  }
+
   for (let i = 0; i < allAttendees.length; i++) {
     for (let j = i + 1; j < allAttendees.length; j++) {
       const key = `${allAttendees[i]}-${allAttendees[j]}`;
@@ -190,6 +197,12 @@ function buildEnhancedConnectionsMap(guests, hosts, connectionsMap, timeLapse) {
         isConstrained: months < timeLapse
       };
 
+      // Count constrained connections for each attendee
+      if (pairData.isConstrained) {
+        constraintCounts[allAttendees[i]]++;
+        constraintCounts[allAttendees[j]]++;
+      }
+
       // Store both directions
       enhanced[key] = pairData;
       enhanced[reverseKey] = pairData;
@@ -197,7 +210,8 @@ function buildEnhancedConnectionsMap(guests, hosts, connectionsMap, timeLapse) {
   }
 
   Logger.log(`Enhanced connections map built: ${Object.keys(enhanced).length} pairs for ${allAttendees.length} attendees`);
-  return enhanced;
+  Logger.log(`Constraint counts computed for ${Object.keys(constraintCounts).length} attendees`);
+  return { enhanced, constraintCounts };
 }
 
 /**
@@ -260,12 +274,21 @@ function buildGrid() {
   const setNeverMatch = buildNeverMatchSet(arrNeverMatch);
 
   // Build enhanced connections map (filtered to tonight's attendees with pre-computed constraints)
-  const connectionsMap = buildEnhancedConnectionsMap(
+  const { enhanced: connectionsMap, constraintCounts } = buildEnhancedConnectionsMap(
     arrGuestsOriginal,
     arrHostsOriginal,
     originalConnectionsMap,
     ctrlTimeLapse
   );
+
+  // Log constraint counts (hardest to seat attendees)
+  const sortedByConstraints = Object.entries(constraintCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+  Logger.log('\n========== Attendees by Constraint Difficulty (Top 10) ==========');
+  sortedByConstraints.forEach(([code, count]) => {
+    Logger.log(`  ${code}: ${count} constrained connections`);
+  });
 
   // GUEST-CENTRIC ALGORITHM
   Logger.log('\n========== Starting BuildGrid (Guest-Centric) ==========');
@@ -293,6 +316,29 @@ function buildGrid() {
     }
   }
 
+  // Sort hosts by constraintCounts (greatest to smallest) - hardest to match first
+  finalHosts.sort((a, b) => {
+    const codeA = a[HOST_COLUMNS.CODE];
+    const codeB = b[HOST_COLUMNS.CODE];
+
+    // Handle blank rows (keep them at the end)
+    if (!codeA || codeA.toString().length === 0) return 1;
+    if (!codeB || codeB.toString().length === 0) return -1;
+
+    const countA = constraintCounts[codeA] || 0;
+    const countB = constraintCounts[codeB] || 0;
+
+    return countB - countA; // Descending order (most constrained first)
+  });
+
+  Logger.log('\n========== Hosts Sorted by Constraint Difficulty ==========');
+  finalHosts.forEach((host, idx) => {
+    if (host[HOST_COLUMNS.CODE]) {
+      const count = constraintCounts[host[HOST_COLUMNS.CODE]] || 0;
+      Logger.log(`  House ${idx + 1}: ${host[HOST_COLUMNS.CODE]} (${count} constrained connections)`);
+    }
+  });
+
   // Initialize grid with hosts
   for (let i = 0; i < finalHosts.length; i++) {
     if (finalHosts[i][HOST_COLUMNS.CODE]) {
@@ -302,6 +348,29 @@ function buildGrid() {
       finalGrid[i][GRID_COLUMNS.SEATED] = finalHosts[i][HOST_COLUMNS.COUNT];
     }
   }
+
+  // Sort guests by constraintCounts (greatest to smallest) - hardest to match first
+  finalGuests.sort((a, b) => {
+    const codeA = a[GUEST_COLUMNS.CODE];
+    const codeB = b[GUEST_COLUMNS.CODE];
+
+    // Handle blank rows (keep them at the end)
+    if (!codeA || codeA.toString().length === 0) return 1;
+    if (!codeB || codeB.toString().length === 0) return -1;
+
+    const countA = constraintCounts[codeA] || 0;
+    const countB = constraintCounts[codeB] || 0;
+
+    return countB - countA; // Descending order (most constrained first)
+  });
+
+  Logger.log('\n========== Guests Sorted by Constraint Difficulty ==========');
+  finalGuests.forEach((guest, idx) => {
+    if (guest[GUEST_COLUMNS.CODE]) {
+      const count = constraintCounts[guest[GUEST_COLUMNS.CODE]] || 0;
+      Logger.log(`  Guest ${idx + 1}: ${guest[GUEST_COLUMNS.CODE]} (${count} constrained connections)`);
+    }
+  });
 
   // PLACE GUESTS - Simple iteration over guest list
   for (let guestIdx = 0; guestIdx < finalGuests.length; guestIdx++) {
@@ -387,10 +456,12 @@ function buildGrid() {
   if (unseatedCount > 0) {
     Logger.log('\n========== UNSEATED GUEST DIAGNOSTIC ==========');
     analyzeUnseatedGuests(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+    Logger.log('\n========== HOST COMPATIBILITY ANALYSIS ==========');
+    analyzeHostCompatibility(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
     Logger.log('===============================================\n');
 
     Logger.log(`Starting Phase 2: Swap Optimization for ${unseatedCount} unseated guests`);
-    const swapResult = attemptSwapOptimization(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+    const swapResult = attemptSwapOptimization(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch, constraintCounts);
     finalGrid = swapResult.grid;
     finalGuests = swapResult.guests;
 
@@ -400,6 +471,10 @@ function buildGrid() {
     if (phase2Unseated > 0) {
       Logger.log('\n========== REMAINING UNSEATED AFTER PHASE 2 ==========');
       analyzeUnseatedGuests(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+      Logger.log('\n========== HOST COMPATIBILITY ANALYSIS ==========');
+      analyzeHostCompatibility(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+      Logger.log('\n========== DETAILED BLOCKING ANALYSIS ==========');
+      analyzeBlockingFactors(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch, constraintCounts);
       Logger.log('======================================================\n');
 
       Logger.log(`\nStarting Phase 3: Selective Constraint Relaxation for ${phase2Unseated} unseated guests`);
@@ -413,6 +488,8 @@ function buildGrid() {
       if (phase3Unseated > 0) {
         Logger.log('\n========== FINAL UNSEATED ANALYSIS ==========');
         analyzeUnseatedGuests(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch);
+        Logger.log('\n========== FINAL DETAILED BLOCKING ANALYSIS ==========');
+        analyzeBlockingFactors(finalGrid, finalGuests, ctrlTimeLapse, connectionsMap, setNeverMatch, constraintCounts);
         Logger.log('=============================================\n');
       }
     }
@@ -892,7 +969,202 @@ function analyzeUnseatedGuests(grid, guests, timeLapse, connectionsMap, setNever
   }
 }
 
-function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+// Analyze host compatibility for unseated guests
+function analyzeHostCompatibility(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+  // Find all unseated guests
+  const unseatedGuests = [];
+  for (let i = 0; i < guests.length; i++) {
+    if (guests[i][GUEST_COLUMNS.CODE] &&
+        guests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        guests[i][GUEST_COLUMNS.SEATED] === "No") {
+      unseatedGuests.push({
+        index: i,
+        code: guests[i][GUEST_COLUMNS.CODE],
+        count: guests[i][GUEST_COLUMNS.COUNT],
+        name: guests[i][GUEST_COLUMNS.NAME] || guests[i][GUEST_COLUMNS.CODE]
+      });
+    }
+  }
+
+  Logger.log(`Analyzing host compatibility for ${unseatedGuests.length} unseated guest(s):\n`);
+
+  // For each unseated guest, check compatibility with each host
+  for (let u = 0; u < unseatedGuests.length; u++) {
+    const guest = unseatedGuests[u];
+    Logger.log(`Guest: ${guest.name} (${guest.code}), Party size: ${guest.count}`);
+
+    const compatibleHosts = [];
+    const incompatibleHosts = [];
+
+    for (let h = 0; h < grid.length; h++) {
+      const hostCode = grid[h][GRID_COLUMNS.HOST];
+      if (!hostCode) continue;
+
+      const houseNum = h + 1;
+      const pairKey = `${guest.code}-${hostCode}`;
+
+      // Check if guest is compatible with the host
+      if (memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+        compatibleHosts.push(houseNum);
+      } else {
+        // Determine why incompatible
+        let reason = '';
+        if (setNeverMatch.has(pairKey)) {
+          reason = 'never-match';
+        } else {
+          const connection = connectionsMap[pairKey];
+          if (connection && connection.isConstrained) {
+            reason = `time-lapse (met ${connection.monthsApart} months ago, need ${timeLapse})`;
+          }
+        }
+        incompatibleHosts.push({ house: houseNum, host: hostCode, reason: reason });
+      }
+    }
+
+    Logger.log(`  Compatible with ${compatibleHosts.length} host(s): ${compatibleHosts.length > 0 ? compatibleHosts.join(', ') : 'NONE'}`);
+
+    if (compatibleHosts.length === 0) {
+      Logger.log(`  ⚠️ CRITICAL: Guest is incompatible with ALL hosts!`);
+    }
+
+    if (incompatibleHosts.length > 0) {
+      Logger.log(`  Incompatible with ${incompatibleHosts.length} host(s):`);
+      incompatibleHosts.forEach(item => {
+        Logger.log(`    - House ${item.house} (Host ${item.host}): ${item.reason}`);
+      });
+    }
+    Logger.log('');
+  }
+}
+
+// Detailed analysis of what's blocking unseated guests in compatible houses
+function analyzeBlockingFactors(grid, guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts) {
+  // Find all unseated guests
+  const unseatedGuests = [];
+  for (let i = 0; i < guests.length; i++) {
+    if (guests[i][GUEST_COLUMNS.CODE] &&
+        guests[i][GUEST_COLUMNS.CODE].toString().length > 0 &&
+        guests[i][GUEST_COLUMNS.SEATED] === "No") {
+      unseatedGuests.push({
+        index: i,
+        code: guests[i][GUEST_COLUMNS.CODE],
+        count: guests[i][GUEST_COLUMNS.COUNT],
+        name: guests[i][GUEST_COLUMNS.NAME] || guests[i][GUEST_COLUMNS.CODE]
+      });
+    }
+  }
+
+  Logger.log(`Detailed blocking analysis for ${unseatedGuests.length} unseated guest(s):\n`);
+
+  for (let u = 0; u < unseatedGuests.length; u++) {
+    const guest = unseatedGuests[u];
+    Logger.log(`\n${'='.repeat(60)}`);
+    Logger.log(`GUEST: ${guest.name} (${guest.code}), Party size: ${guest.count}`);
+    Logger.log(`Constraint count: ${constraintCounts[guest.code] || 0}`);
+    Logger.log(`${'='.repeat(60)}\n`);
+
+    let hasAnyCompatibleHouse = false;
+
+    for (let h = 0; h < grid.length; h++) {
+      const hostCode = grid[h][GRID_COLUMNS.HOST];
+      if (!hostCode) continue;
+
+      const houseNum = h + 1;
+      const houseSeats = grid[h][GRID_COLUMNS.SEATS];
+      const houseSeated = grid[h][GRID_COLUMNS.SEATED];
+      const houseMembers = getHouseMembers(grid[h]);
+
+      // Check if compatible with host
+      const hostPairKey = `${guest.code}-${hostCode}`;
+      if (!memberMatch(hostPairKey, timeLapse, connectionsMap, setNeverMatch)) {
+        continue; // Skip houses where guest is incompatible with host
+      }
+
+      // Host is compatible - analyze what's blocking
+      Logger.log(`House ${houseNum} (Host: ${hostCode}) - HOST COMPATIBLE:`);
+      hasAnyCompatibleHouse = true;
+
+      const blockingReasons = [];
+      let canFit = true;
+
+      // Check capacity
+      if (houseSeated + guest.count > houseSeats) {
+        blockingReasons.push(`❌ CAPACITY: Need ${guest.count} seats, only ${houseSeats - houseSeated} available (${houseSeated}/${houseSeats} filled)`);
+        canFit = false;
+      } else {
+        Logger.log(`  ✓ Capacity: ${houseSeats - houseSeated} seats available (${houseSeated}/${houseSeats} filled)`);
+      }
+
+      // Check slot availability
+      if (houseMembers.length >= 6) {
+        blockingReasons.push(`❌ SLOTS: House full (6/6 members)`);
+        canFit = false;
+      } else {
+        Logger.log(`  ✓ Slots: ${6 - houseMembers.length} slots available (${houseMembers.length}/6 members)`);
+      }
+
+      // Check compatibility with each member
+      const incompatibleMembers = [];
+      for (let m = 0; m < houseMembers.length; m++) {
+        if (houseMembers[m] === hostCode) continue; // Already checked host
+
+        const memberCode = houseMembers[m];
+        const pairKey = `${guest.code}-${memberCode}`;
+
+        if (!memberMatch(pairKey, timeLapse, connectionsMap, setNeverMatch)) {
+          let reason = '';
+          if (setNeverMatch.has(pairKey)) {
+            reason = 'NEVER-MATCH';
+          } else {
+            const connection = connectionsMap[pairKey];
+            if (connection && connection.isConstrained) {
+              reason = `TIME-LAPSE (met ${connection.monthsApart} months ago, need ${timeLapse})`;
+            }
+          }
+
+          const memberConstraints = constraintCounts[memberCode] || 0;
+          incompatibleMembers.push({
+            code: memberCode,
+            reason: reason,
+            constraints: memberConstraints
+          });
+          canFit = false;
+        }
+      }
+
+      if (incompatibleMembers.length > 0) {
+        Logger.log(`  ❌ INCOMPATIBLE MEMBERS (${incompatibleMembers.length}):`);
+        incompatibleMembers.forEach(m => {
+          Logger.log(`     - ${m.code} (${m.constraints} constraints): ${m.reason}`);
+        });
+
+        // Highlight if blocking members have low constraints (could be swapped)
+        const flexibleBlockers = incompatibleMembers.filter(m => m.constraints <= 2);
+        if (flexibleBlockers.length > 0) {
+          Logger.log(`     ⚠️ ${flexibleBlockers.length} blocking member(s) have LOW constraints (≤2) and might be swappable!`);
+        }
+      } else {
+        Logger.log(`  ✓ Compatible with all ${houseMembers.length - 1} guest(s) in house`);
+      }
+
+      if (canFit) {
+        Logger.log(`  ✅ THIS GUEST COULD FIT IN THIS HOUSE! (Why wasn't it placed?)`);
+      } else {
+        Logger.log(`  Summary: BLOCKED by ${blockingReasons.length > 0 ? blockingReasons.map(r => r.split(':')[0].replace('❌', '').trim()).join(' + ') : 'incompatible members'}`);
+      }
+
+      Logger.log('');
+    }
+
+    if (!hasAnyCompatibleHouse) {
+      Logger.log(`  ⚠️ NO HOUSES with compatible hosts!\n`);
+    }
+  }
+
+  Logger.log(`${'='.repeat(60)}\n`);
+}
+
+function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts) {
   // Phase 2: Enhanced multi-strategy swap optimization
   const workingGrid = grid.map(row => [...row]);
   const workingGuests = guests.map(row => [...row]);
@@ -901,7 +1173,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
 
   // STRATEGY 1: Simple 1-for-1 swaps (original logic)
   Logger.log('Phase 2.1: Attempting simple 1-for-1 swaps');
-  const result1 = attemptSimpleSwaps(workingGrid, workingGuests, timeLapse, connectionsMap, setNeverMatch);
+  const result1 = attemptSimpleSwaps(workingGrid, workingGuests, timeLapse, connectionsMap, setNeverMatch, constraintCounts);
   totalSwapsMade += result1.swapsMade;
 
   if (result1.unseatedCount === 0) {
@@ -911,7 +1183,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
 
   // STRATEGY 2: 2-way swaps between seated guests
   Logger.log(`Phase 2.2: Attempting 2-way swaps (${result1.unseatedCount} still unseated)`);
-  const result2 = attemptTwoWaySwaps(result1.grid, result1.guests, timeLapse, connectionsMap, setNeverMatch);
+  const result2 = attemptTwoWaySwaps(result1.grid, result1.guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts);
   totalSwapsMade += result2.swapsMade;
 
   if (result2.unseatedCount === 0) {
@@ -921,7 +1193,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
 
   // STRATEGY 3: Chain swaps for remaining unseated guests
   Logger.log(`Phase 2.3: Attempting chain swaps (${result2.unseatedCount} still unseated)`);
-  const result3 = attemptChainSwaps(result2.grid, result2.guests, timeLapse, connectionsMap, setNeverMatch);
+  const result3 = attemptChainSwaps(result2.grid, result2.guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts);
   totalSwapsMade += result3.swapsMade;
 
   if (result3.unseatedCount === 0) {
@@ -932,7 +1204,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
 
   // STRATEGY 4: Capacity Consolidation - redistribute singles to create space for couples
   Logger.log(`Phase 2.4: Attempting capacity consolidation (${result3.unseatedCount} still unseated)`);
-  const result4 = attemptCapacityConsolidation(result3.grid, result3.guests, timeLapse, connectionsMap, setNeverMatch);
+  const result4 = attemptCapacityConsolidation(result3.grid, result3.guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts);
   totalSwapsMade += result4.swapsMade;
 
   Logger.log(`Total swaps made: ${totalSwapsMade}, Final unseated: ${result4.unseatedCount}`);
@@ -940,7 +1212,7 @@ function attemptSwapOptimization(grid, guests, timeLapse, connectionsMap, setNev
 }
 
 // STRATEGY 1: Simple 1-for-1 swaps
-function attemptSimpleSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+function attemptSimpleSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts) {
   const workingGrid = grid.map(row => [...row]);
   const workingGuests = guests.map(row => [...row]);
 
@@ -975,9 +1247,19 @@ function attemptSimpleSwaps(grid, guests, timeLapse, connectionsMap, setNeverMat
       // Get all members currently in this house
       const houseMembers = getHouseMembers(workingGrid[houseIdx]);
 
-      // Try swapping with each seated guest in this house (except host)
-      for (let m = 1; m < houseMembers.length && !wasSeated; m++) {
-        const seatedGuestCode = houseMembers[m];
+      // Sort house members by constraintCounts (lowest first) - skip host (index 0)
+      const sortedMembers = [];
+      for (let m = 1; m < houseMembers.length; m++) {
+        sortedMembers.push({
+          code: houseMembers[m],
+          constraints: constraintCounts[houseMembers[m]] || 0
+        });
+      }
+      sortedMembers.sort((a, b) => a.constraints - b.constraints);
+
+      // Try swapping with each seated guest (most flexible first)
+      for (let m = 0; m < sortedMembers.length && !wasSeated; m++) {
+        const seatedGuestCode = sortedMembers[m].code;
 
         // Find this seated guest's info
         let seatedGuestIdx = -1;
@@ -1069,7 +1351,7 @@ function attemptSimpleSwaps(grid, guests, timeLapse, connectionsMap, setNeverMat
             wasSeated = true;
             swapsMade++;
 
-            Logger.log(`Simple swap: ${unseatedGuest.code} into house ${houseIdx + 1}, ${seatedGuestCode} to house ${otherHouseIdx + 1}`);
+            Logger.log(`Simple swap: ${unseatedGuest.code} into house ${houseIdx + 1}, ${seatedGuestCode} (${sortedMembers[m].constraints} constraints) to house ${otherHouseIdx + 1}`);
           }
         }
       }
@@ -1085,7 +1367,7 @@ function attemptSimpleSwaps(grid, guests, timeLapse, connectionsMap, setNeverMat
 }
 
 // STRATEGY 2: 2-way swaps - swap two seated guests between houses
-function attemptTwoWaySwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+function attemptTwoWaySwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts) {
   const workingGrid = grid.map(row => [...row]);
   const workingGuests = guests.map(row => [...row]);
   let swapsMade = 0;
@@ -1119,19 +1401,39 @@ function attemptTwoWaySwaps(grid, guests, timeLapse, connectionsMap, setNeverMat
 
     const house1Members = getHouseMembers(workingGrid[house1]);
 
+    // Sort house1 members by constraintCounts (lowest first) - skip host
+    const sortedHouse1Members = [];
+    for (let m = 1; m < house1Members.length; m++) {
+      sortedHouse1Members.push({
+        code: house1Members[m],
+        constraints: constraintCounts[house1Members[m]] || 0
+      });
+    }
+    sortedHouse1Members.sort((a, b) => a.constraints - b.constraints);
+
     for (let house2 = house1 + 1; house2 < workingGrid.length; house2++) {
       if (!workingGrid[house2][GRID_COLUMNS.HOST]) continue;
 
       const house2Members = getHouseMembers(workingGrid[house2]);
 
-      // Try swapping each guest from house1 with each guest from house2
-      for (let g1 = 1; g1 < house1Members.length; g1++) { // Skip host (index 0)
-        const guest1Code = house1Members[g1];
+      // Sort house2 members by constraintCounts (lowest first) - skip host
+      const sortedHouse2Members = [];
+      for (let m = 1; m < house2Members.length; m++) {
+        sortedHouse2Members.push({
+          code: house2Members[m],
+          constraints: constraintCounts[house2Members[m]] || 0
+        });
+      }
+      sortedHouse2Members.sort((a, b) => a.constraints - b.constraints);
+
+      // Try swapping each guest from house1 with each guest from house2 (most flexible first)
+      for (let g1 = 0; g1 < sortedHouse1Members.length; g1++) {
+        const guest1Code = sortedHouse1Members[g1].code;
         const guest1Info = findGuestInfo(workingGuests, guest1Code);
         if (!guest1Info) continue;
 
-        for (let g2 = 1; g2 < house2Members.length; g2++) { // Skip host
-          const guest2Code = house2Members[g2];
+        for (let g2 = 0; g2 < sortedHouse2Members.length; g2++) {
+          const guest2Code = sortedHouse2Members[g2].code;
           const guest2Info = findGuestInfo(workingGuests, guest2Code);
           if (!guest2Info) continue;
 
@@ -1248,7 +1550,7 @@ function attemptTwoWaySwaps(grid, guests, timeLapse, connectionsMap, setNeverMat
             workingGrid[house2][GRID_COLUMNS.SEATED] = newHouse2Seated;
 
             swapsMade++;
-            Logger.log(`2-way swap: ${guest1Code} (house ${house1 + 1}→${house2 + 1}) ↔ ${guest2Code} (house ${house2 + 1}→${house1 + 1})`);
+            Logger.log(`2-way swap: ${guest1Code} (${sortedHouse1Members[g1].constraints} constraints, house ${house1 + 1}→${house2 + 1}) ↔ ${guest2Code} (${sortedHouse2Members[g2].constraints} constraints, house ${house2 + 1}→${house1 + 1})`);
 
             // Now try to place an unseated guest in the newly opened spot
             for (let u = 0; u < unseatedGuests.length; u++) {
@@ -1316,7 +1618,7 @@ function attemptTwoWaySwaps(grid, guests, timeLapse, connectionsMap, setNeverMat
 }
 
 // STRATEGY 3: Chain swaps - try relocating multiple guests to seat an unseated one
-function attemptChainSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+function attemptChainSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts) {
   const workingGrid = grid.map(row => [...row]);
   const workingGuests = guests.map(row => [...row]);
   let swapsMade = 0;
@@ -1456,7 +1758,7 @@ function attemptChainSwaps(grid, guests, timeLapse, connectionsMap, setNeverMatc
 }
 
 // STRATEGY 4: Capacity Consolidation - move singles around to create space for couples
-function attemptCapacityConsolidation(grid, guests, timeLapse, connectionsMap, setNeverMatch) {
+function attemptCapacityConsolidation(grid, guests, timeLapse, connectionsMap, setNeverMatch, constraintCounts) {
   const workingGrid = grid.map(row => [...row]);
   const workingGuests = guests.map(row => [...row]);
   let swapsMade = 0;
@@ -1545,13 +1847,29 @@ function attemptCapacityConsolidation(grid, guests, timeLapse, connectionsMap, s
 
       if (!coupleCompatible) continue;
 
-      // Find a single guest in this house to relocate
+      // Find singles in this house and sort by constraintCounts (lowest first)
+      const singlesInHouse = [];
       for (let m = 1; m < houseMembers.length; m++) { // Skip host (index 0)
-        const singleGuestCode = houseMembers[m];
-        const singleGuestInfo = findGuestInfo(workingGuests, singleGuestCode);
+        const guestCode = houseMembers[m];
+        const guestInfo = findGuestInfo(workingGuests, guestCode);
 
-        // Only move singles
-        if (!singleGuestInfo || singleGuestInfo.count !== 1) continue;
+        // Only consider singles
+        if (guestInfo && guestInfo.count === 1) {
+          singlesInHouse.push({
+            code: guestCode,
+            info: guestInfo,
+            constraints: constraintCounts[guestCode] || 0
+          });
+        }
+      }
+
+      // Sort singles by constraints (lowest first - most flexible)
+      singlesInHouse.sort((a, b) => a.constraints - b.constraints);
+
+      // Try to relocate singles (most flexible first)
+      for (let s = 0; s < singlesInHouse.length; s++) {
+        const singleGuestCode = singlesInHouse[s].code;
+        const singleGuestInfo = singlesInHouse[s].info;
 
         // Try to find a destination for this single
         for (let destHouse = 0; destHouse < workingGrid.length; destHouse++) {
@@ -1602,7 +1920,7 @@ function attemptCapacityConsolidation(grid, guests, timeLapse, connectionsMap, s
               workingGuests[couple.index][GUEST_COLUMNS.SEATED] = null;
 
               swapsMade++;
-              Logger.log(`Capacity consolidation: Moved ${singleGuestCode} (house ${targetHouse + 1}→${destHouse + 1}), seated ${couple.name} in house ${targetHouse + 1}`);
+              Logger.log(`Capacity consolidation: Moved ${singleGuestCode} (${singlesInHouse[s].constraints} constraints, house ${targetHouse + 1}→${destHouse + 1}), seated ${couple.name} in house ${targetHouse + 1}`);
 
               // Move to next unseated couple
               break;
