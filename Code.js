@@ -2,6 +2,9 @@
 // 1. create a list of options where the unseated guests will work best.
 // 
 
+/** CENTRAL SPREADSHEET - Connections history lives here, shared across all GridBuilder sheets */
+const CONNECTIONS_SPREADSHEET_ID = '1Saq0rXFWj2IHfoYDwyjperNOXZuanYSbu57AGvB5dPk';
+
 /** CONSTANTS - Array Column Indices */
 const HOST_COLUMNS = {
   CODE: 0,
@@ -46,8 +49,7 @@ const LOOKAHEAD_CRITICAL_THRESHOLD = 2; // Look-ahead protection for guests with
 
 /** CACHE HELPER FUNCTIONS */
 function buildConnectionsCache() {
-  const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+  const dbSheet = SpreadsheetApp.openById(CONNECTIONS_SPREADSHEET_ID).getSheetByName('connectionsDB');
   const arrDB = dbSheet.getDataRange().getValues().slice();
   arrDB.splice(0, 1); // Remove header
 
@@ -2135,9 +2137,9 @@ function prepConnections() {
     return;
   }
 
-  // Get the connections data from the sheet
+  // Get the connections data from the central spreadsheet
   const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+  const dbSheet = SpreadsheetApp.openById(CONNECTIONS_SPREADSHEET_ID).getSheetByName('connectionsDB');
   const arrDB = dbSheet.getDataRange().getValues().slice();
   const headerRow = arrDB[0];
   arrDB.splice(0, 1);
@@ -2156,10 +2158,31 @@ function prepConnections() {
   const connectionsRange = dbSheet.getRange(1, 1, rowCount, colCount);
   connectionsRange.setValues(arrDB);
 
-  // Rebuild cache after updating connections
+  // Rebuild script cache after updating connections
   clearConnectionsCache();
   buildConnectionsCache();
+
+  // Refresh the local connectionsCache sheet in the active spreadsheet
+  refreshLocalConnectionsCache(spreadSheet, arrDB);
 }
+
+/**
+ * Writes the full connectionsDB data to a local connectionsCache sheet
+ * in the given spreadsheet. Creates the sheet if it doesn't exist.
+ * @param {Spreadsheet} spreadSheet - The local GridBuilder spreadsheet
+ * @param {Array} data - Full data array including header row
+ */
+function refreshLocalConnectionsCache(spreadSheet, data) {
+  let cacheSheet = spreadSheet.getSheetByName('connectionsCache');
+  if (!cacheSheet) {
+    cacheSheet = spreadSheet.insertSheet('connectionsCache');
+  } else {
+    cacheSheet.clearContents();
+  }
+  cacheSheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+  cacheSheet.hideSheet();
+}
+
 function updateConnections() {
   // Takes the final grid for a dinner and creates new entries in the connectionsDB sheet
   // for each pair of members that sat together at a dinner
@@ -2171,14 +2194,14 @@ function updateConnections() {
     return;
   }
 
-  // Get the connections data from the sheet
+  // Get the connections data from the central spreadsheet
   const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+  const dbSheet = SpreadsheetApp.openById(CONNECTIONS_SPREADSHEET_ID).getSheetByName('connectionsDB');
   const arrDB = dbSheet.getDataRange().getValues().slice();
   const headerRow = arrDB[0];
   arrDB.splice(0, 1);
 
-  // Get the Grid from the worksheet
+  // Get the Grid from the local worksheet
   const gridSheet = spreadSheet.getSheetByName('GridBuilder');
   const arrGrid = gridSheet.getRange('rangeGrid').getValues().slice();
   arrGrid.splice(0, 1);
@@ -2186,6 +2209,36 @@ function updateConnections() {
   // Retrieve the range of control values to get the dinner date
   const arrControl = spreadSheet.getRangeByName('controlVariables').getValues();
   const ctrlNextDinnerDate = new Date(arrControl[2]);
+
+  // Check for existing records matching this dinner date
+  const dinnerYear = ctrlNextDinnerDate.getFullYear();
+  const dinnerMonth = ctrlNextDinnerDate.getMonth();
+  const dinnerDay = ctrlNextDinnerDate.getDate();
+  const existingIndices = [];
+  for (let i = 0; i < arrDB.length; i++) {
+    const rowDate = new Date(arrDB[i][CONNECTION_COLUMNS.DATE]);
+    if (rowDate.getFullYear() === dinnerYear &&
+        rowDate.getMonth() === dinnerMonth &&
+        rowDate.getDate() === dinnerDay) {
+      existingIndices.push(i);
+    }
+  }
+
+  if (existingIndices.length > 0) {
+    const dateStr = ctrlNextDinnerDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    const overwriteResult = SpreadsheetApp.getUi().alert(
+      'Duplicate Data Found',
+      `${existingIndices.length} records from the dinner on ${dateStr} already exist in the connections history.\n\nClick OK to delete the existing records and replace them, or Cancel to stop.`,
+      SpreadsheetApp.getUi().ButtonSet.OK_CANCEL
+    );
+    if (overwriteResult !== SpreadsheetApp.getUi().Button.OK) {
+      return;
+    }
+    // Delete existing records for this date (iterate in reverse to preserve indices)
+    for (let i = existingIndices.length - 1; i >= 0; i--) {
+      arrDB.splice(existingIndices[i], 1);
+    }
+  }
 
   // Count the number of houses to process - remove blank rows
   for (let i = arrGrid.length - 1; i >= 0; i--) {
@@ -2206,9 +2259,9 @@ function updateConnections() {
     }
 
     // Create connections for all pairs of members in the house
-    for (let j = 1; j < guestCount; j++) {
-      const isHost = (j === 1) ? "Host" : "";
-      for (let k = j; k < guestCount; k++) {
+    for (let j = 0; j < guestCount; j++) {
+      const isHost = (j === 0) ? "Host" : "";
+      for (let k = j + 1; k < guestCount; k++) {
         writeConnection(
           arrGrid[i][j + GRID_COLUMNS.HOST],
           arrGrid[i][k + GRID_COLUMNS.HOST],
@@ -2278,7 +2331,7 @@ function reportUnseatedMembers(arrGuests, guestCodeIdx, guestSeatedIdx) {
 function auditGrid() {
   const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
   const gridSheet = spreadSheet.getSheetByName('GridBuilder');
-  const dbSheet = spreadSheet.getSheetByName('connectionsDB');
+  const dbSheet = SpreadsheetApp.openById(CONNECTIONS_SPREADSHEET_ID).getSheetByName('connectionsDB');
 
   // Get time lapse threshold from control variables
   const arrControl = spreadSheet.getRangeByName('controlVariables').getValues();
