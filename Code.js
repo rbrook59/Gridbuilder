@@ -2776,12 +2776,358 @@ function auditGrid() {
   // Switch to Grid Audit sheet
   auditSheet.activate();
 }
+/** GRID OUTPUT - layout of the printable seating report */
+const GRID_OUTPUT = {
+  SHEET_NAME: 'Grid Output',
+  HEADER_ROW: 3,          // Rows 1-2 are left untouched
+  NUM_COLS: 6,            // Host + Guest 1..5
+  HEADERS: ['Host', 'Guest 1', 'Guest 2', 'Guest 3', 'Guest 4', 'Guest 5']
+};
+
+/** Column indices within the 'rsvp' named range (RSVP!A11:Q90) */
+const RSVP_COLUMNS = {
+  CODE: 0,       // Member Code
+  FULL_NAME: 5,  // Full Name
+  ADDRESS: 6,    // Address
+  PHONE: 7       // Phone 1
+};
+
+function normaliseMemberCode(value) {
+  return value === null || value === undefined ? '' : String(value).trim().toUpperCase();
+}
+
+/**
+ * Builds the 'Grid Output' report from values (not formulas), so it stays correct
+ * even when names in rangeGrid are moved around with Shift-Delete / insert cells.
+ * Host cells show Name / Address / Phone; guest cells show Name / Phone.
+ */
+function createGridOutput() {
+  const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  const gridSheet = spreadSheet.getSheetByName('GridBuilder');
+  if (!gridSheet) {
+    throw new Error('Sheet "GridBuilder" not found');
+  }
+  const rsvpRange = spreadSheet.getRangeByName('rsvp');
+  if (!rsvpRange) {
+    throw new Error('Named range "rsvp" not found');
+  }
+
+  // Read the grid by its named range (skip header row)
+  const arrGrid = gridSheet.getRange('rangeGrid').getValues().slice(1);
+
+  // Member code -> RSVP row (case-insensitive, like VLOOKUP)
+  const rsvpLookup = new Map();
+  rsvpRange.getValues().forEach(row => {
+    const code = normaliseMemberCode(row[RSVP_COLUMNS.CODE]);
+    if (code && !rsvpLookup.has(code)) {
+      rsvpLookup.set(code, row);
+    }
+  });
+
+  const missingCodes = [];
+  const seenCodes = new Map(); // code -> count, to detect duplicates in the grid
+
+  const describeMember = (rawCode, includeAddress) => {
+    const code = normaliseMemberCode(rawCode);
+    seenCodes.set(code, (seenCodes.get(code) || 0) + 1);
+
+    const rsvpRow = rsvpLookup.get(code);
+    if (!rsvpRow) {
+      missingCodes.push(String(rawCode).trim());
+      return `${String(rawCode).trim()}\n(not found in RSVP)`;
+    }
+    const parts = [rsvpRow[RSVP_COLUMNS.FULL_NAME]];
+    if (includeAddress) parts.push(rsvpRow[RSVP_COLUMNS.ADDRESS]);
+    parts.push(rsvpRow[RSVP_COLUMNS.PHONE]);
+    return parts
+      .map(p => (p === null || p === undefined ? '' : String(p).trim()))
+      .filter(p => p.length > 0)
+      .join('\n');
+  };
+
+  // Build one output row per house that has anyone seated
+  const outputRows = [];
+  let guestTotal = 0;
+  arrGrid.forEach(gridRow => {
+    const host = normaliseMemberCode(gridRow[GRID_COLUMNS.HOST]);
+    const guests = gridRow
+      .slice(GRID_COLUMNS.GUEST_1, GRID_COLUMNS.GUEST_5 + 1)
+      .filter(g => normaliseMemberCode(g)); // closes any gaps left by moved names
+
+    if (!host && guests.length === 0) return;
+
+    const outRow = new Array(GRID_OUTPUT.NUM_COLS).fill('');
+    outRow[0] = host ? describeMember(gridRow[GRID_COLUMNS.HOST], true) : '(no host)';
+    guests.slice(0, GRID_OUTPUT.NUM_COLS - 1).forEach((g, i) => {
+      outRow[i + 1] = describeMember(g, false);
+    });
+    guestTotal += guests.length;
+    outputRows.push(outRow);
+  });
+
+  if (outputRows.length === 0) {
+    ui.alert('Create Grid Output', 'The Grid (rangeGrid) is empty - nothing to output.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // Get or create the output sheet
+  let outSheet = spreadSheet.getSheetByName(GRID_OUTPUT.SHEET_NAME);
+  if (!outSheet) {
+    outSheet = spreadSheet.insertSheet(GRID_OUTPUT.SHEET_NAME);
+    outSheet.setColumnWidth(1, 136);
+    outSheet.setColumnWidths(2, GRID_OUTPUT.NUM_COLS - 1, 115);
+    outSheet.getRange(GRID_OUTPUT.HEADER_ROW, 1, 1, GRID_OUTPUT.NUM_COLS)
+      .setFontWeight('bold')
+      .setBackground('#d9d9d9');
+    outSheet.setFrozenRows(GRID_OUTPUT.HEADER_ROW);
+  }
+
+  const firstDataRow = GRID_OUTPUT.HEADER_ROW + 1;
+  const previousRows = Math.max(0, outSheet.getLastRow() - GRID_OUTPUT.HEADER_ROW);
+
+  // Make sure the sheet is tall enough
+  const rowsNeeded = firstDataRow + outputRows.length - 1;
+  if (outSheet.getMaxRows() < rowsNeeded) {
+    outSheet.insertRowsAfter(outSheet.getMaxRows(), rowsNeeded - outSheet.getMaxRows());
+  }
+
+  // Clear old content (including the old formulas) below the header
+  const clearRows = outSheet.getMaxRows() - firstDataRow + 1;
+  outSheet.getRange(firstDataRow, 1, clearRows, GRID_OUTPUT.NUM_COLS).clearContent();
+
+  // Write header and data
+  outSheet.getRange(GRID_OUTPUT.HEADER_ROW, 1, 1, GRID_OUTPUT.NUM_COLS)
+    .setValues([GRID_OUTPUT.HEADERS]);
+
+  const dataRange = outSheet.getRange(firstDataRow, 1, outputRows.length, GRID_OUTPUT.NUM_COLS);
+  dataRange.setValues(outputRows)
+    .setFontFamily('Arial')
+    .setFontSize(10)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('top')
+    .setWrap(true);
+
+  // Fit row heights to the new content (and shrink rows that held old content)
+  SpreadsheetApp.flush();
+  outSheet.autoResizeRows(firstDataRow, Math.max(outputRows.length, previousRows));
+
+  // Summary
+  const duplicateCodes = [...seenCodes.entries()].filter(([, n]) => n > 1).map(([c]) => c);
+  let msg = `Grid Output created: ${outputRows.length} houses, ${guestTotal} guest entries.`;
+  if (missingCodes.length > 0) {
+    msg += `\n\n⚠️ Not found in RSVP (check spelling of member code):\n  ${missingCodes.join(', ')}`;
+  }
+  if (duplicateCodes.length > 0) {
+    msg += `\n\n⚠️ Seated more than once in the Grid:\n  ${duplicateCodes.join(', ')}`;
+  }
+  const title = (missingCodes.length || duplicateCodes.length) ? 'Grid Output - Check Warnings' : 'Grid Output Complete';
+  ui.alert(title, msg, ui.ButtonSet.OK);
+
+  outSheet.activate();
+}
+
+/** GRID DOCUMENT - portrait Letter page layout (points; 72pt = 1 inch) */
+const GRID_DOC = {
+  PAGE_WIDTH: 612,
+  PAGE_HEIGHT: 792,
+  MARGIN: 36,
+  HOST_COL_WIDTH: 120,         // remaining width is shared by the 5 guest columns
+  MAX_FONT: 11,
+  MIN_FONT: 6,
+  FONT_STEP: 0.5,
+  CELL_PAD_X: 3,
+  CELL_PAD_Y: 2,
+  CHAR_WIDTH_EM: 0.6,          // conservative Arial character width (bold names)
+  HEADER_BG: '#d9d9d9',
+  FILE_SUFFIX: ' - Seating Grid'
+};
+
+/**
+ * Picks the largest font size at which the longest single word in every column fits
+ * within that column's width, so text wraps between words but never splits a word.
+ * Height is not considered - the table is allowed to flow onto further pages.
+ */
+function chooseGridDocFontSize(rows, colWidths) {
+  const longestWord = colWidths.map((_, col) =>
+    rows.reduce((max, row) => {
+      const words = String(row[col] || '').split(/\s+/);
+      return Math.max(max, ...words.map(w => w.length));
+    }, 1)
+  );
+  for (let size = GRID_DOC.MAX_FONT; size >= GRID_DOC.MIN_FONT; size -= GRID_DOC.FONT_STEP) {
+    const charWidth = size * GRID_DOC.CHAR_WIDTH_EM;
+    const allFit = colWidths.every((w, col) =>
+      longestWord[col] * charWidth <= w - 2 * GRID_DOC.CELL_PAD_X);
+    if (allFit) return size;
+  }
+  return GRID_DOC.MIN_FONT;
+}
+
+/** Returns the Drive folder containing the active spreadsheet (falls back to My Drive root). */
+function getSpreadsheetFolder(spreadSheet) {
+  const parents = DriveApp.getFileById(spreadSheet.getId()).getParents();
+  return parents.hasNext() ? parents.next() : DriveApp.getRootFolder();
+}
+
+/** Returns non-trashed files in a folder with an exact name and (optionally) MIME type. */
+function findFilesInFolder(folder, name, mimeType) {
+  const found = [];
+  const files = folder.getFilesByName(name);
+  while (files.hasNext()) {
+    const file = files.next();
+    if (!file.isTrashed() && (!mimeType || file.getMimeType() === mimeType)) found.push(file);
+  }
+  return found;
+}
+
+/**
+ * Writes the Grid Output sheet to a portrait Google Doc and a Word (.docx) copy,
+ * saved in the same Drive folder as this spreadsheet. Previous versions are replaced.
+ */
+function outputGridToDoc() {
+  const spreadSheet = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  // 1. Read the Grid Output sheet (so manual edits made there are kept)
+  const outSheet = spreadSheet.getSheetByName(GRID_OUTPUT.SHEET_NAME);
+  const dataRowCount = outSheet ? outSheet.getLastRow() - GRID_OUTPUT.HEADER_ROW : 0;
+  const rows = dataRowCount > 0
+    ? outSheet.getRange(GRID_OUTPUT.HEADER_ROW + 1, 1, dataRowCount, GRID_OUTPUT.NUM_COLS)
+        .getDisplayValues()
+        .filter(row => row.some(cell => String(cell).trim() !== ''))
+    : [];
+  if (rows.length === 0) {
+    ui.alert('Output Grid to Word Doc',
+      `The "${GRID_OUTPUT.SHEET_NAME}" sheet is empty. Run "Create Grid Output" first.`,
+      ui.ButtonSet.OK);
+    return;
+  }
+
+  // 2. Title from the dinner date in controlVariables
+  let title = 'Dinner Seating Grid';
+  const controlRange = spreadSheet.getRangeByName('controlVariables');
+  if (controlRange) {
+    const dinnerDate = new Date(controlRange.getValues()[2][0]);
+    if (!isNaN(dinnerDate.getTime())) {
+      title += ' - ' + Utilities.formatDate(dinnerDate, spreadSheet.getSpreadsheetTimeZone(), 'EEEE, MMMM d, yyyy');
+    }
+  }
+
+  // 3. Layout: table spans the portrait page width; font sized so columns fit across
+  const contentWidth = GRID_DOC.PAGE_WIDTH - 2 * GRID_DOC.MARGIN;
+  const guestColWidth = (contentWidth - GRID_DOC.HOST_COL_WIDTH) / (GRID_OUTPUT.NUM_COLS - 1);
+  const colWidths = [GRID_DOC.HOST_COL_WIDTH, ...new Array(GRID_OUTPUT.NUM_COLS - 1).fill(guestColWidth)];
+  const fontSize = chooseGridDocFontSize([GRID_OUTPUT.HEADERS, ...rows], colWidths);
+
+  // 4. Find or create the Google Doc in the spreadsheet's folder
+  const folder = getSpreadsheetFolder(spreadSheet);
+  const baseName = spreadSheet.getName() + GRID_DOC.FILE_SUFFIX;
+  const existingDocs = findFilesInFolder(folder, baseName, MimeType.GOOGLE_DOCS);
+  let doc;
+  if (existingDocs.length > 0) {
+    doc = DocumentApp.openById(existingDocs[0].getId());
+    existingDocs.slice(1).forEach(f => f.setTrashed(true)); // remove any duplicates
+  } else {
+    doc = DocumentApp.create(baseName);
+    DriveApp.getFileById(doc.getId()).moveTo(folder);
+  }
+
+  // 5. Build the document
+  const body = doc.getBody();
+  body.clear();
+  body.setPageWidth(GRID_DOC.PAGE_WIDTH)
+    .setPageHeight(GRID_DOC.PAGE_HEIGHT)
+    .setMarginTop(GRID_DOC.MARGIN)
+    .setMarginBottom(GRID_DOC.MARGIN)
+    .setMarginLeft(GRID_DOC.MARGIN)
+    .setMarginRight(GRID_DOC.MARGIN);
+
+  const titlePara = body.getParagraphs()[0];
+  titlePara.setText(title); // Paragraph.setText() returns nothing, so it can't be chained
+  titlePara.setAlignment(DocumentApp.HorizontalAlignment.CENTER)
+    .setSpacingBefore(0)
+    .setSpacingAfter(6)
+    .editAsText().setFontFamily('Arial').setFontSize(fontSize + 4).setBold(true);
+
+  // Split each cell into its lines (name / address / phone). Docs rejects empty text
+  // elements, so the table is created with each cell's first line, or a single space if empty.
+  const tableLines = [GRID_OUTPUT.HEADERS, ...rows].map(r => r.map(value =>
+    String(value).split('\n').map(l => l.trim()).filter(l => l.length > 0)));
+  const table = body.appendTable(tableLines.map(r => r.map(lines => lines[0] || ' ')));
+  table.setBorderWidth(0.5).setBorderColor('#999999');
+  colWidths.forEach((w, i) => table.setColumnWidth(i, w));
+
+  const styleParagraph = (para, bold) => {
+    para.setAlignment(DocumentApp.HorizontalAlignment.CENTER)
+      .setSpacingBefore(0)
+      .setSpacingAfter(0)
+      .setLineSpacing(1);
+    para.editAsText().setFontFamily('Arial').setFontSize(fontSize).setBold(bold);
+  };
+
+  tableLines.forEach((rowLines, r) => {
+    const tableRow = table.getRow(r);
+    rowLines.forEach((lines, c) => {
+      const cell = tableRow.getCell(c);
+      cell.setPaddingTop(GRID_DOC.CELL_PAD_Y)
+        .setPaddingBottom(GRID_DOC.CELL_PAD_Y)
+        .setPaddingLeft(GRID_DOC.CELL_PAD_X)
+        .setPaddingRight(GRID_DOC.CELL_PAD_X)
+        .setVerticalAlignment(DocumentApp.VerticalAlignment.TOP);
+      if (r === 0) cell.setBackgroundColor(GRID_DOC.HEADER_BG);
+
+      // First line is already in the cell from appendTable(); add the remaining lines
+      styleParagraph(cell.getChild(0).asParagraph(), true); // header text and member name in bold
+      lines.slice(1).forEach(line => styleParagraph(cell.appendParagraph(line), false));
+    });
+  });
+
+  // Keep the mandatory trailing paragraph after the table tiny so it can't create a blank page
+  const paras = body.getParagraphs();
+  const lastPara = paras[paras.length - 1];
+  const tinyFont = {};
+  tinyFont[DocumentApp.Attribute.FONT_SIZE] = 1;
+  if (lastPara.getParent().getType() === DocumentApp.ElementType.BODY_SECTION) {
+    lastPara.setSpacingBefore(0).setSpacingAfter(0).setAttributes(tinyFont); // empty, so style it directly
+  }
+
+  doc.saveAndClose();
+
+  // 6. Export a Word copy, replacing any earlier one
+  const docxName = baseName + '.docx';
+  const response = UrlFetchApp.fetch(
+    `https://docs.google.com/document/d/${doc.getId()}/export?format=docx`,
+    { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true }
+  );
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`Word export failed (HTTP ${response.getResponseCode()}). The Google Doc was still saved: ${doc.getUrl()}`);
+  }
+  findFilesInFolder(folder, docxName).forEach(f => f.setTrashed(true));
+  const docxFile = folder.createFile(response.getBlob().setName(docxName));
+
+  // 7. Report with clickable links
+  const escape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const html = HtmlService.createHtmlOutput(
+    `<div style="font-family:Arial;font-size:13px">
+       <p>${rows.length} houses written at ${fontSize}pt, portrait, to folder <b>${escape(folder.getName())}</b>:</p>
+       <p>📄 <a href="${doc.getUrl()}" target="_blank">${escape(baseName)}</a> (Google Doc)</p>
+       <p>📝 <a href="${docxFile.getUrl()}" target="_blank">${escape(docxName)}</a> (Word)</p>
+     </div>`
+  ).setWidth(460).setHeight(170);
+  ui.showModalDialog(html, 'Grid Document Created');
+}
+
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('Grid Builder')
     .addItem('Build Grid', 'buildGrid')
     .addSeparator()
     .addItem('Audit Current Grid', 'auditGrid')
+    .addSeparator()
+    .addItem('Create Grid Output', 'createGridOutput')
+    .addItem('Output Grid to Word Doc', 'outputGridToDoc')
     .addSeparator()
     .addItem('Prepare Connections Data', 'prepConnections')
     .addSeparator()

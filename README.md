@@ -46,6 +46,9 @@ function onOpen() {
     .addSeparator()
     .addItem('Audit Current Grid', 'auditGrid')
     .addSeparator()
+    .addItem('Create Grid Output', 'createGridOutput')
+    .addItem('Output Grid to Word Doc', 'outputGridToDoc')
+    .addSeparator()
     .addItem('Prepare Connections Data', 'prepConnections')
     .addSeparator()
     .addItem('Post dinner -> Update Connections History', 'updateConnections')
@@ -54,6 +57,8 @@ function onOpen() {
 
 function buildGrid()        { Gridbuilder.buildGrid(); }
 function auditGrid()        { Gridbuilder.auditGrid(); }
+function createGridOutput() { Gridbuilder.createGridOutput(); }
+function outputGridToDoc()  { Gridbuilder.outputGridToDoc(); }
 function prepConnections()  { Gridbuilder.prepConnections(); }
 function updateConnections(){ Gridbuilder.updateConnections(); }
 ```
